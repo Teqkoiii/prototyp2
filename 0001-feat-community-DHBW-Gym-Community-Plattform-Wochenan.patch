@@ -1,0 +1,5282 @@
+From 00495c0e1f6285c8b87777e8df62f00c35c97b78 Mon Sep 17 00:00:00 2001
+From: DHBW Gym Developer <dreamskxng@gmail.com>
+Date: Mon, 19 Oct 2026 19:59:05 +0000
+Subject: [PATCH 1/2] feat(community): DHBW Gym Community-Plattform &
+ Wochenansicht
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Gemeinsamer Kalender mit Wochenansicht (Mo-So), Tages-Inspector und Direktplanung
+- Visualisierung von Trainingsplänen & absolvierten Workouts im Wochenkontext
+- Live-Anwesenheitsabgleich (Check-in/Check-out) ohne Kapazitätssperren
+- Community-Bereich mit Profilen, Trainingszielen und Trainingspartner-Anfragen
+- Datenschutzfreundliche Sichtbarkeitseinstellungen & DHBW-E-Mail-Validierung
+---
+ server.ts                       |   42 +
+ server/community.test.ts        |  186 +++++
+ server/gym-app-api.ts           |   45 +-
+ server/gymAppRepository.ts      |  390 +++++++++-
+ server/gymAppService.ts         |  233 +++++-
+ src/features/gym/Calendar.tsx   |  896 +++++++++++++++++++++-
+ src/features/gym/Community.tsx  |  472 ++++++++++++
+ src/features/gym/GymApp.tsx     |  436 +++++++++--
+ src/features/gym/Profile.tsx    |  527 ++++++++++++-
+ src/features/gym/components.tsx |    5 +-
+ src/features/gym/format.ts      |   41 +
+ src/features/gym/gym.css        | 1266 +++++++++++++++++++++++++++++++
+ src/services/gymRepository.ts   |  148 +++-
+ src/services/presenceWidget.ts  |   56 +-
+ 14 files changed, 4547 insertions(+), 196 deletions(-)
+ create mode 100644 server.ts
+ create mode 100644 server/community.test.ts
+ create mode 100644 src/features/gym/Community.tsx
+
+diff --git a/server.ts b/server.ts
+new file mode 100644
+index 0000000..ba155a1
+--- /dev/null
++++ b/server.ts
+@@ -0,0 +1,42 @@
++import 'dotenv/config';
++import express from 'express';
++import { DatabaseSync } from 'node:sqlite';
++import { mkdirSync } from 'node:fs';
++import { dirname, resolve } from 'node:path';
++import { createGymAppApi } from './server/gym-app-api';
++
++const isProduction = process.env.NODE_ENV === 'production';
++const port = Number(process.env.PORT || 3000);
++
++const databasePath = resolve(process.env.GYM_APP_DATABASE_PATH || './data/gym-app.sqlite3');
++mkdirSync(dirname(databasePath), { recursive: true });
++const database = new DatabaseSync(databasePath);
++
++const app = express();
++app.set('trust proxy', true);
++
++const gymApi = createGymAppApi(database, {
++  secureCookies: isProduction,
++  maxCheckInHours: Number(process.env.GYM_MAX_CHECK_IN_HOURS || 8),
++});
++
++app.use(gymApi);
++
++if (!isProduction) {
++  const { createServer: createViteServer } = await import('vite');
++  const vite = await createViteServer({
++    server: { middlewareMode: true },
++    appType: 'spa',
++  });
++  app.use(vite.middlewares);
++} else {
++  const distPath = resolve('dist');
++  app.use(express.static(distPath));
++  app.get('*', (_req, res) => {
++    res.sendFile(resolve(distPath, 'index.html'));
++  });
++}
++
++app.listen(port, '0.0.0.0', () => {
++  console.info(`DHBW Gym Community server running on http://0.0.0.0:${port}`);
++});
+diff --git a/server/community.test.ts b/server/community.test.ts
+new file mode 100644
+index 0000000..7f3fa78
+--- /dev/null
++++ b/server/community.test.ts
+@@ -0,0 +1,186 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { DatabaseSync } from 'node:sqlite';
++import { createGymAppApi } from './gym-app-api';
++import { isDhbwEmail } from './gymAppService';
++
++test('isDhbwEmail accurately validates official DHBW email domains', () => {
++  assert.equal(isDhbwEmail('student@bad-mergentheim.dhbw.de'), true);
++  assert.equal(isDhbwEmail('max.mustermann@dhbw-stuttgart.de'), true);
++  assert.equal(isDhbwEmail('dozent@lehre.dhbw-mannheim.de'), true);
++  assert.equal(isDhbwEmail('info@dhbw.de'), true);
++  assert.equal(isDhbwEmail('student@dhbw-mosbach.de'), true);
++  assert.equal(isDhbwEmail('student@gmail.com'), false);
++  assert.equal(isDhbwEmail('attacker@evil-dhbw.com'), false);
++  assert.equal(isDhbwEmail('not-an-email'), false);
++});
++
++test('DHBW Gym Community API workflow: registration domain check, privacy, calendar and partner requests', async (t) => {
++  const db = new DatabaseSync(':memory:');
++  const app = createGymAppApi(db, {
++    maxCheckInHours: 8,
++    secureCookies: false,
++  });
++
++  const server = await new Promise<import('node:http').Server>((resolve) => {
++    const s = app.listen(0, '127.0.0.1', () => resolve(s));
++  });
++  t.after(() => server.close());
++
++  const address = server.address() as import('node:net').AddressInfo;
++  const baseUrl = `http://127.0.0.1:${address.port}`;
++
++  // Helper for requests
++  async function api(path: string, options: { method?: string; body?: any; cookie?: string } = {}) {
++    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
++    if (options.cookie) headers['Cookie'] = options.cookie;
++    const response = await fetch(`${baseUrl}${path}`, {
++      method: options.method || 'GET',
++      headers,
++      body: options.body ? JSON.stringify(options.body) : undefined,
++    });
++    const setCookie = response.headers.get('set-cookie');
++    const cookie = setCookie ? setCookie.split(';')[0] : undefined;
++    const data = response.status !== 204 ? await response.json() : null;
++    return { status: response.status, data, cookie };
++  }
++
++  // 1. Rejection of non-DHBW email
++  const failReg = await api('/api/gym/register', {
++    method: 'POST',
++    body: { email: 'student@external-univ.de', password: 'Password1234!' },
++  });
++  assert.equal(failReg.status, 400);
++  assert.match(failReg.data.error, /DHBW-E-Mail/i);
++
++  // 2. Successful registration of User A (DHBW Bad Mergentheim)
++  const regUserA = await api('/api/gym/register', {
++    method: 'POST',
++    body: {
++      email: 'anna.schmidt@bad-mergentheim.dhbw.de',
++      password: 'StrongPassword123!',
++      firstName: 'Anna',
++      lastNameInitial: 'S',
++      courseOfStudy: 'Wirtschaftsinformatik',
++      trainingGoals: ['Hypertrophie (Muskelaufbau)', 'Kraftsport'],
++      preferredTimes: ['Nachmittags (15:00 - 18:00)'],
++    },
++  });
++  assert.equal(regUserA.status, 201);
++  const cookieA = regUserA.cookie;
++  assert.ok(cookieA);
++
++  // 3. User A checks their community profile
++  const profA = await api('/api/gym/profile/community', { cookie: cookieA });
++  assert.equal(profA.status, 200);
++  assert.equal(profA.data.profile.firstName, 'Anna');
++  assert.equal(profA.data.profile.lastNameInitial, 'S');
++  assert.equal(profA.data.profile.isPublicPresence, true);
++
++  // 4. Register User B (DHBW Mosbach)
++  const regUserB = await api('/api/gym/register', {
++    method: 'POST',
++    body: {
++      email: 'ben.mueller@dhbw-mosbach.de',
++      password: 'StrongPassword456!',
++      firstName: 'Ben',
++      lastNameInitial: 'M',
++      courseOfStudy: 'Angewandte Informatik',
++      trainingGoals: ['Kraftsport'],
++      preferredTimes: ['Nachmittags (15:00 - 18:00)'],
++    },
++  });
++  assert.equal(regUserB.status, 201);
++  const cookieB = regUserB.cookie;
++  assert.ok(cookieB);
++
++  // 5. User A creates a planned attendance in Calendar
++  const tomorrow = new Date(Date.now() + 86400_000);
++  tomorrow.setHours(16, 0, 0, 0);
++  const createPlanned = await api('/api/gym/bookings', {
++    method: 'POST',
++    cookie: cookieA,
++    body: {
++      startsAt: tomorrow.toISOString(),
++      durationMinutes: 90,
++      title: 'Oberkörper / Bankdrücken',
++      entryType: 'planned',
++    },
++  });
++  assert.equal(createPlanned.status, 201);
++  assert.equal(createPlanned.data.booking.entryType, 'planned');
++
++  // 6. User B views calendar events - sees Anna S.'s planned session
++  const calEvents = await api('/api/gym/calendar/events', { cookie: cookieB });
++  assert.equal(calEvents.status, 200);
++  const foundAnnaEvent = calEvents.data.events.find((e: any) => e.title === 'Oberkörper / Bankdrücken');
++  assert.ok(foundAnnaEvent, 'User B should see Anna planned training');
++  assert.equal(foundAnnaEvent.entryType, 'planned');
++  assert.equal(foundAnnaEvent.userName, 'Anna S.');
++  assert.equal(foundAnnaEvent.isMine, false);
++
++  // 7. Privacy check: Anna switches isPublicPresence to false
++  await api('/api/gym/profile/community', {
++    method: 'PUT',
++    cookie: cookieA,
++    body: { isPublicPresence: false },
++  });
++
++  // User B views calendar again - Anna's name is now masked for privacy
++  const calEventsAfterPrivate = await api('/api/gym/calendar/events', { cookie: cookieB });
++  const maskedEvent = calEventsAfterPrivate.data.events.find((e: any) => e.id === foundAnnaEvent.id);
++  assert.ok(maskedEvent);
++  assert.equal(maskedEvent.userName, 'Anonymer DHBW Student');
++
++  // But Anna herself still sees her own name
++  const annaOwnCalendar = await api('/api/gym/calendar/events', { cookie: cookieA });
++  const ownEvent = annaOwnCalendar.data.events.find((e: any) => e.id === foundAnnaEvent.id);
++  assert.ok(ownEvent);
++  assert.equal(ownEvent.isMine, true);
++
++  // 8. User B sends User A a partner request
++  const members = await api('/api/gym/community/members', { cookie: cookieB });
++  assert.equal(members.status, 200);
++  const annaMember = members.data.members.find((m: any) => m.firstName === 'Anna');
++  assert.ok(annaMember);
++
++  const partnerReq = await api('/api/gym/community/partner-requests', {
++    method: 'POST',
++    cookie: cookieB,
++    body: {
++      receiverId: annaMember.id,
++      proposedDate: tomorrow.toISOString(),
++      note: 'Hi Anna, trainieren wir morgen zusammen Bankdrücken?',
++    },
++  });
++  assert.equal(partnerReq.status, 201);
++
++  // 9. User A receives and accepts the partner request
++  const annaRequests = await api('/api/gym/community/partner-requests', { cookie: cookieA });
++  assert.equal(annaRequests.status, 200);
++  const incoming = annaRequests.data.requests.find((r: any) => r.id === partnerReq.data.id);
++  assert.ok(incoming);
++  assert.equal(incoming.isIncoming, true);
++  assert.equal(incoming.status, 'pending');
++
++  const acceptReq = await api(`/api/gym/community/partner-requests/${incoming.id}`, {
++    method: 'PUT',
++    cookie: cookieA,
++    body: { status: 'accepted' },
++  });
++  assert.equal(acceptReq.status, 200);
++  assert.equal(acceptReq.data.status, 'accepted');
++
++  // 10. Check-in and Check-out
++  const checkInRes = await api('/api/gym/check-in', { method: 'POST', cookie: cookieA });
++  assert.equal(checkInRes.status, 200);
++  assert.ok(checkInRes.data.checkedInAt);
++
++  // Live occupancy includes active check-in
++  const occupancy = await api('/api/gym/occupancy', { cookie: cookieB });
++  assert.ok(occupancy.data.count >= 1);
++
++  // Check-out
++  const checkOutRes = await api('/api/gym/check-out', { method: 'POST', cookie: cookieA });
++  assert.equal(checkOutRes.status, 200);
++});
+diff --git a/server/gym-app-api.ts b/server/gym-app-api.ts
+index faf651b..af85636 100644
+--- a/server/gym-app-api.ts
++++ b/server/gym-app-api.ts
+@@ -1,4 +1,4 @@
+-﻿import express, { type NextFunction, type Request, type Response } from 'express';
++import express, { type NextFunction, type Request, type Response } from 'express';
+ import type { DatabaseSync } from 'node:sqlite';
+ import { GymAppRepository } from './gymAppRepository';
+ import { GymAppService, GymDomainError } from './gymAppService';
+@@ -72,6 +72,7 @@ export function createGymAppApi(database: DatabaseSync, options: GymApiOptions =
+   occupancySamplingTimer.unref();
+ 
+   const app = express();
++  app.set('trust proxy', true);
+   app.disable('x-powered-by');
+   app.use(express.json({ limit: '12kb', type: 'application/json' }));
+   app.use((_request, response, next) => {
+@@ -83,16 +84,16 @@ export function createGymAppApi(database: DatabaseSync, options: GymApiOptions =
+ 
+   app.use((request, response, next) => {
+     const origin = request.get('Origin');
++    const effectiveHost = request.get('x-forwarded-host') || request.get('host');
+     let sameOrigin = false;
+     if (origin) {
+-      try { sameOrigin = new URL(origin).host === request.get('host'); } catch { sameOrigin = false; }
++      try {
++        const originHost = new URL(origin).host;
++        sameOrigin = originHost === effectiveHost || originHost === request.get('host');
++      } catch {
++        sameOrigin = false;
++      }
+     }
+-    console.log('[Origin-Debug]', {
+-      origin,
+-      host: request.get('host'),
+-      sameOrigin,
+-      allowedOrigins: [...allowedOrigins],
+-    });
+     const allowed = !origin || sameOrigin || allowedOrigins.has(origin);
+     if (!allowed) {
+       response.status(403).json({ error: 'origin is not allowed' });
+@@ -168,6 +169,34 @@ export function createGymAppApi(database: DatabaseSync, options: GymApiOptions =
+     response.json(service.listBookingSlots(request.query.from, request.query.to));
+   });
+ 
++  app.get('/api/gym/calendar/events', requireSession, (request: GymSessionRequest, response) => {
++    response.json(service.getCalendarEvents(request.principalId!, request.query.from, request.query.to));
++  });
++
++  app.get('/api/gym/profile/community', requireSession, (request: GymSessionRequest, response) => {
++    response.json({ profile: service.getCommunityProfile(request.principalId!) });
++  });
++
++  app.put('/api/gym/profile/community', requireSession, (request: GymSessionRequest, response) => {
++    response.json({ profile: service.updateCommunityProfile(request.principalId!, request.body) });
++  });
++
++  app.get('/api/gym/community/members', requireSession, (request: GymSessionRequest, response) => {
++    response.json({ members: service.listCommunityMembers(request.principalId!) });
++  });
++
++  app.get('/api/gym/community/partner-requests', requireSession, (request: GymSessionRequest, response) => {
++    response.json({ requests: service.listPartnerRequests(request.principalId!) });
++  });
++
++  app.post('/api/gym/community/partner-requests', requireSession, (request: GymSessionRequest, response) => {
++    response.status(201).json(service.createPartnerRequest(request.principalId!, request.body));
++  });
++
++  app.put('/api/gym/community/partner-requests/:id', requireSession, (request: GymSessionRequest, response) => {
++    response.json(service.updatePartnerRequestStatus(request.principalId!, request.params.id ?? '', request.body));
++  });
++
+   app.get('/api/gym/my/bookings', requireSession, (request: GymSessionRequest, response) => {
+     response.json({ bookings: service.listMyBookings(request.principalId!) });
+   });
+diff --git a/server/gymAppRepository.ts b/server/gymAppRepository.ts
+index c9704b5..c0c4815 100644
+--- a/server/gymAppRepository.ts
++++ b/server/gymAppRepository.ts
+@@ -7,6 +7,46 @@ export interface BookingRecord {
+   endsAt: string;
+   title: string;
+   status: 'planned' | 'cancelled';
++  entryType?: 'planned' | 'reservation';
++}
++
++export interface CommunityProfileRecord {
++  principalId: string;
++  firstName: string;
++  lastNameInitial: string;
++  courseOfStudy: string;
++  trainingGoals: string[];
++  preferredTimes: string[];
++  interests: string[];
++  bio: string;
++  isPublicPresence: boolean;
++  updatedAt: string;
++}
++
++export interface TrainingPartnerRequestRecord {
++  id: string;
++  senderId: string;
++  receiverId: string;
++  senderName: string;
++  receiverName: string;
++  proposedDate: string | null;
++  note: string;
++  status: 'pending' | 'accepted' | 'declined' | 'cancelled';
++  isIncoming: boolean;
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface CalendarEventItem {
++  id: string;
++  startsAt: string;
++  endsAt: string;
++  title: string;
++  entryType: 'planned' | 'reservation';
++  isMine: boolean;
++  userName?: string;
++  courseOfStudy?: string;
++  userGoals?: string[];
+ }
+ 
+ export interface WorkoutRecord {
+@@ -114,7 +154,7 @@ export class GymAppRepository {
+     this.migrate();
+   }
+ 
+-  private tableColumns(table: 'gym_reservations' | 'workouts'): Set<string> {
++  private tableColumns(table: string): Set<string> {
+     const rows = this.database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+     return new Set(rows.map((row) => row.name));
+   }
+@@ -127,6 +167,9 @@ export class GymAppRepository {
+     if (!reservationColumns.has('cancelled_at')) {
+       this.database.exec('ALTER TABLE gym_reservations ADD COLUMN cancelled_at TEXT');
+     }
++    if (!reservationColumns.has('entry_type')) {
++      this.database.exec("ALTER TABLE gym_reservations ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'planned'");
++    }
+     const workoutColumns = this.tableColumns('workouts');
+     if (!workoutColumns.has('notes')) {
+       this.database.exec("ALTER TABLE workouts ADD COLUMN notes TEXT NOT NULL DEFAULT ''");
+@@ -163,6 +206,30 @@ export class GymAppRepository {
+         target_reps INTEGER,
+         target_weight_kg REAL
+       );
++      CREATE TABLE IF NOT EXISTS community_profiles (
++        principal_id TEXT PRIMARY KEY REFERENCES gym_principals(id) ON DELETE CASCADE,
++        first_name TEXT NOT NULL,
++        last_name_initial TEXT NOT NULL,
++        course_of_study TEXT NOT NULL DEFAULT '',
++        training_goals TEXT NOT NULL DEFAULT '[]',
++        preferred_times TEXT NOT NULL DEFAULT '[]',
++        interests TEXT NOT NULL DEFAULT '[]',
++        bio TEXT NOT NULL DEFAULT '',
++        is_public_presence INTEGER NOT NULL DEFAULT 1 CHECK (is_public_presence IN (0, 1)),
++        updated_at TEXT NOT NULL
++      );
++      CREATE TABLE IF NOT EXISTS training_partner_requests (
++        id TEXT PRIMARY KEY,
++        sender_id TEXT NOT NULL REFERENCES gym_principals(id) ON DELETE CASCADE,
++        receiver_id TEXT NOT NULL REFERENCES gym_principals(id) ON DELETE CASCADE,
++        proposed_date TEXT,
++        note TEXT NOT NULL DEFAULT '',
++        status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'declined', 'cancelled')),
++        created_at TEXT NOT NULL,
++        updated_at TEXT NOT NULL
++      );
++      CREATE INDEX IF NOT EXISTS idx_partner_requests_receiver ON training_partner_requests(receiver_id, status);
++      CREATE INDEX IF NOT EXISTS idx_partner_requests_sender ON training_partner_requests(sender_id, status);
+     `);
+   }
+ 
+@@ -383,9 +450,9 @@ export class GymAppRepository {
+     this.database.exec('BEGIN IMMEDIATE');
+     try {
+       this.database.prepare(`
+-        INSERT INTO gym_reservations(id, principal_id, starts_at, ends_at, title, created_at, status)
+-        VALUES (?, ?, ?, ?, ?, ?, 'planned')
+-      `).run(booking.id, principalId, booking.startsAt, booking.endsAt, booking.title, createdAt);
++        INSERT INTO gym_reservations(id, principal_id, starts_at, ends_at, title, created_at, status, entry_type)
++        VALUES (?, ?, ?, ?, ?, ?, 'planned', ?)
++      `).run(booking.id, principalId, booking.startsAt, booking.endsAt, booking.title, createdAt, booking.entryType ?? 'planned');
+       const availability = this.availability(booking.startsAt, booking.endsAt);
+       this.database.exec('COMMIT');
+       return { availability };
+@@ -407,11 +474,11 @@ export class GymAppRepository {
+         return 'missing';
+       }
+       this.database.prepare(`
+-        UPDATE gym_reservations SET starts_at = ?, ends_at = ?, title = ?, created_at = ?
++        UPDATE gym_reservations SET starts_at = ?, ends_at = ?, title = ?, created_at = ?, entry_type = ?
+         WHERE id = ? AND principal_id = ? AND status = 'planned'
+-      `).run(booking.startsAt, booking.endsAt, booking.title, updatedAt, id, principalId);
++      `).run(booking.startsAt, booking.endsAt, booking.title, updatedAt, booking.entryType ?? 'planned', id, principalId);
+       this.database.exec('COMMIT');
+-      return { id, ...booking, status: 'planned' };
++      return { id, ...booking, status: 'planned', entryType: booking.entryType ?? 'planned' };
+     } catch (error) {
+       this.database.exec('ROLLBACK');
+       if (isUniqueConstraint(error)) return 'duplicate';
+@@ -421,7 +488,7 @@ export class GymAppRepository {
+ 
+   listMyBookings(principalId: string): BookingRecord[] {
+     return this.database.prepare(`
+-      SELECT id, starts_at AS startsAt, ends_at AS endsAt, title, status
++      SELECT id, starts_at AS startsAt, ends_at AS endsAt, title, status, entry_type AS entryType
+       FROM gym_reservations
+       WHERE principal_id = ? AND status = 'planned'
+       ORDER BY starts_at ASC
+@@ -558,6 +625,301 @@ export class GymAppRepository {
+     `).run(principalId, weeklySessions, updatedAt);
+   }
+ 
++  getCommunityProfile(principalId: string): CommunityProfileRecord | undefined {
++    const row = this.database.prepare(`
++      SELECT principal_id AS principalId, first_name AS firstName, last_name_initial AS lastNameInitial,
++             course_of_study AS courseOfStudy, training_goals AS trainingGoalsJson,
++             preferred_times AS preferredTimesJson, interests AS interestsJson, bio,
++             is_public_presence AS isPublicPresence, updated_at AS updatedAt
++      FROM community_profiles WHERE principal_id = ?
++    `).get(principalId) as {
++      principalId: string;
++      firstName: string;
++      lastNameInitial: string;
++      courseOfStudy: string;
++      trainingGoalsJson: string;
++      preferredTimesJson: string;
++      interestsJson: string;
++      bio: string;
++      isPublicPresence: number;
++      updatedAt: string;
++    } | undefined;
++
++    if (!row) return undefined;
++    return {
++      principalId: row.principalId,
++      firstName: row.firstName,
++      lastNameInitial: row.lastNameInitial,
++      courseOfStudy: row.courseOfStudy || '',
++      trainingGoals: safeJsonParseArray(row.trainingGoalsJson),
++      preferredTimes: safeJsonParseArray(row.preferredTimesJson),
++      interests: safeJsonParseArray(row.interestsJson),
++      bio: row.bio || '',
++      isPublicPresence: Boolean(row.isPublicPresence),
++      updatedAt: row.updatedAt,
++    };
++  }
++
++  upsertCommunityProfile(profile: CommunityProfileRecord): void {
++    this.database.prepare(`
++      INSERT INTO community_profiles(principal_id, first_name, last_name_initial, course_of_study,
++                                     training_goals, preferred_times, interests, bio, is_public_presence, updated_at)
++      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++      ON CONFLICT(principal_id) DO UPDATE SET
++        first_name = excluded.first_name,
++        last_name_initial = excluded.last_name_initial,
++        course_of_study = excluded.course_of_study,
++        training_goals = excluded.training_goals,
++        preferred_times = excluded.preferred_times,
++        interests = excluded.interests,
++        bio = excluded.bio,
++        is_public_presence = excluded.is_public_presence,
++        updated_at = excluded.updated_at
++    `).run(
++      profile.principalId,
++      profile.firstName,
++      profile.lastNameInitial,
++      profile.courseOfStudy,
++      JSON.stringify(profile.trainingGoals),
++      JSON.stringify(profile.preferredTimes),
++      JSON.stringify(profile.interests),
++      profile.bio,
++      profile.isPublicPresence ? 1 : 0,
++      profile.updatedAt,
++    );
++  }
++
++  listCommunityMembers(currentPrincipalId: string, nowIso: string): Array<{
++    id: string;
++    firstName: string;
++    lastNameInitial: string;
++    courseOfStudy: string;
++    trainingGoals: string[];
++    preferredTimes: string[];
++    interests: string[];
++    bio: string;
++    isPublicPresence: boolean;
++    activeNow: boolean;
++    plannedNext: string | null;
++    isSelf: boolean;
++  }> {
++    const rows = this.database.prepare(`
++      SELECT cp.principal_id AS principalId, cp.first_name AS firstName, cp.last_name_initial AS lastNameInitial,
++             cp.course_of_study AS courseOfStudy, cp.training_goals AS trainingGoalsJson,
++             cp.preferred_times AS preferredTimesJson, cp.interests AS interestsJson, cp.bio,
++             cp.is_public_presence AS isPublicPresence,
++             (SELECT 1 FROM manual_check_ins m WHERE m.principal_id = cp.principal_id AND m.expires_at > ?) AS isActive,
++             (SELECT r.starts_at FROM gym_reservations r WHERE r.principal_id = cp.principal_id AND r.status = 'planned' AND r.starts_at > ? ORDER BY r.starts_at ASC LIMIT 1) AS nextPlanned
++      FROM community_profiles cp
++      ORDER BY cp.updated_at DESC
++    `).all(nowIso, nowIso) as Array<{
++      principalId: string;
++      firstName: string;
++      lastNameInitial: string;
++      courseOfStudy: string;
++      trainingGoalsJson: string;
++      preferredTimesJson: string;
++      interestsJson: string;
++      bio: string;
++      isPublicPresence: number;
++      isActive: number | null;
++      nextPlanned: string | null;
++    }>;
++
++    return rows.map((row) => ({
++      id: row.principalId,
++      firstName: row.firstName,
++      lastNameInitial: row.lastNameInitial,
++      courseOfStudy: row.courseOfStudy || '',
++      trainingGoals: safeJsonParseArray(row.trainingGoalsJson),
++      preferredTimes: safeJsonParseArray(row.preferredTimesJson),
++      interests: safeJsonParseArray(row.interestsJson),
++      bio: row.bio || '',
++      isPublicPresence: Boolean(row.isPublicPresence),
++      activeNow: Boolean(row.isActive),
++      plannedNext: row.nextPlanned ?? null,
++      isSelf: row.principalId === currentPrincipalId,
++    }));
++  }
++
++  listCalendarEvents(fromIso: string, toIso: string, currentPrincipalId: string): CalendarEventItem[] {
++    const rows = this.database.prepare(`
++      SELECT r.id, r.principal_id AS principalId, r.starts_at AS startsAt, r.ends_at AS endsAt,
++             r.title, r.entry_type AS entryType,
++             cp.first_name AS firstName, cp.last_name_initial AS lastNameInitial,
++             cp.course_of_study AS courseOfStudy, cp.training_goals AS trainingGoalsJson,
++             COALESCE(cp.is_public_presence, 1) AS isPublicPresence
++      FROM gym_reservations r
++      LEFT JOIN community_profiles cp ON cp.principal_id = r.principal_id
++      WHERE r.status = 'planned' AND r.starts_at < ? AND r.ends_at > ?
++      ORDER BY r.starts_at ASC
++    `).all(toIso, fromIso) as Array<{
++      id: string;
++      principalId: string;
++      startsAt: string;
++      endsAt: string;
++      title: string;
++      entryType: string;
++      firstName: string | null;
++      lastNameInitial: string | null;
++      courseOfStudy: string | null;
++      trainingGoalsJson: string | null;
++      isPublicPresence: number | null;
++    }>;
++
++    return rows.map((row) => {
++      const isMine = row.principalId === currentPrincipalId;
++      const isPublic = Boolean(row.isPublicPresence ?? 1);
++      const showIdentity = isMine || isPublic;
++      let goals: string[] | undefined;
++      if (showIdentity && row.trainingGoalsJson) {
++        try { goals = JSON.parse(row.trainingGoalsJson); } catch {}
++      }
++
++      return {
++        id: row.id,
++        startsAt: row.startsAt,
++        endsAt: row.endsAt,
++        title: row.title || (row.entryType === 'reservation' ? 'Gym Reservierung' : 'Geplantes Training'),
++        entryType: (row.entryType === 'reservation' ? 'reservation' : 'planned') as 'planned' | 'reservation',
++        isMine,
++        userName: showIdentity && row.firstName ? `${row.firstName} ${row.lastNameInitial || ''}.` : (showIdentity ? 'DHBW Student' : 'Anonymer DHBW Student'),
++        courseOfStudy: showIdentity ? (row.courseOfStudy || undefined) : undefined,
++        userGoals: goals,
++      };
++    });
++  }
++
++  listActiveCheckInsWithIdentity(nowIso: string, currentPrincipalId: string): Array<{
++    id: string;
++    checkedInAt: string;
++    expiresAt: string;
++    isMine: boolean;
++    userName: string;
++    courseOfStudy?: string;
++    trainingGoals?: string[];
++  }> {
++    const rows = this.database.prepare(`
++      SELECT m.principal_id AS principalId, m.checked_in_at AS checkedInAt, m.expires_at AS expiresAt,
++             cp.first_name AS firstName, cp.last_name_initial AS lastNameInitial,
++             cp.course_of_study AS courseOfStudy, cp.training_goals AS trainingGoalsJson,
++             COALESCE(cp.is_public_presence, 1) AS isPublicPresence
++      FROM manual_check_ins m
++      LEFT JOIN community_profiles cp ON cp.principal_id = m.principal_id
++      WHERE m.expires_at > ?
++      ORDER BY m.checked_in_at ASC
++    `).all(nowIso) as Array<{
++      principalId: string;
++      checkedInAt: string;
++      expiresAt: string;
++      firstName: string | null;
++      lastNameInitial: string | null;
++      courseOfStudy: string | null;
++      trainingGoalsJson: string | null;
++      isPublicPresence: number | null;
++    }>;
++
++    return rows.map((row) => {
++      const isMine = row.principalId === currentPrincipalId;
++      const isPublic = Boolean(row.isPublicPresence ?? 1);
++      const showIdentity = isMine || isPublic;
++      let goals: string[] | undefined;
++      if (showIdentity && row.trainingGoalsJson) {
++        try { goals = JSON.parse(row.trainingGoalsJson); } catch {}
++      }
++
++      return {
++        id: row.principalId,
++        checkedInAt: row.checkedInAt,
++        expiresAt: row.expiresAt,
++        isMine,
++        userName: showIdentity && row.firstName ? `${row.firstName} ${row.lastNameInitial || ''}.` : (showIdentity ? 'DHBW Student' : 'Anonymer DHBW Student'),
++        courseOfStudy: showIdentity ? (row.courseOfStudy || undefined) : undefined,
++        trainingGoals: goals,
++      };
++    });
++  }
++
++  createPartnerRequest(request: {
++    id: string;
++    senderId: string;
++    receiverId: string;
++    proposedDate: string | null;
++    note: string;
++    status: 'pending';
++    createdAt: string;
++    updatedAt: string;
++  }): void {
++    this.database.prepare(`
++      INSERT INTO training_partner_requests(id, sender_id, receiver_id, proposed_date, note, status, created_at, updated_at)
++      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
++    `).run(
++      request.id,
++      request.senderId,
++      request.receiverId,
++      request.proposedDate,
++      request.note,
++      request.status,
++      request.createdAt,
++      request.updatedAt,
++    );
++  }
++
++  listPartnerRequests(principalId: string): Array<TrainingPartnerRequestRecord> {
++    const rows = this.database.prepare(`
++      SELECT r.id, r.sender_id AS senderId, r.receiver_id AS receiverId,
++             r.proposed_date AS proposedDate, r.note, r.status, r.created_at AS createdAt, r.updated_at AS updatedAt,
++             sp.first_name AS senderFirst, sp.last_name_initial AS senderInitial,
++             rp.first_name AS receiverFirst, rp.last_name_initial AS receiverInitial
++      FROM training_partner_requests r
++      LEFT JOIN community_profiles sp ON sp.principal_id = r.sender_id
++      LEFT JOIN community_profiles rp ON rp.principal_id = r.receiver_id
++      WHERE r.sender_id = ? OR r.receiver_id = ?
++      ORDER BY r.created_at DESC
++    `).all(principalId, principalId) as Array<{
++      id: string;
++      senderId: string;
++      receiverId: string;
++      proposedDate: string | null;
++      note: string;
++      status: 'pending' | 'accepted' | 'declined' | 'cancelled';
++      createdAt: string;
++      updatedAt: string;
++      senderFirst: string | null;
++      senderInitial: string | null;
++      receiverFirst: string | null;
++      receiverInitial: string | null;
++    }>;
++
++    return rows.map((row) => ({
++      id: row.id,
++      senderId: row.senderId,
++      receiverId: row.receiverId,
++      senderName: row.senderFirst ? `${row.senderFirst} ${row.senderInitial || ''}.` : 'DHBW Student',
++      receiverName: row.receiverFirst ? `${row.receiverFirst} ${row.receiverInitial || ''}.` : 'DHBW Student',
++      proposedDate: row.proposedDate ?? null,
++      note: row.note,
++      status: row.status,
++      isIncoming: row.receiverId === principalId,
++      createdAt: row.createdAt,
++      updatedAt: row.updatedAt,
++    }));
++  }
++
++  updatePartnerRequestStatus(id: string, principalId: string, status: 'accepted' | 'declined' | 'cancelled', updatedAt: string): boolean {
++    if (status === 'accepted' || status === 'declined') {
++      return this.database.prepare(`
++        UPDATE training_partner_requests SET status = ?, updated_at = ?
++        WHERE id = ? AND receiver_id = ? AND status = 'pending'
++      `).run(status, updatedAt, id, principalId).changes > 0;
++    } else {
++      return this.database.prepare(`
++        UPDATE training_partner_requests SET status = ?, updated_at = ?
++        WHERE id = ? AND sender_id = ? AND status = 'pending'
++      `).run(status, updatedAt, id, principalId).changes > 0;
++    }
++  }
++
+   deletePersonalData(principalId: string): void {
+     this.database.exec('BEGIN IMMEDIATE');
+     try {
+@@ -568,6 +930,8 @@ export class GymAppRepository {
+       this.database.prepare('DELETE FROM training_plans WHERE principal_id = ?').run(principalId);
+       this.database.prepare('DELETE FROM training_goals WHERE principal_id = ?').run(principalId);
+       this.database.prepare('DELETE FROM profile_recovery_tokens WHERE principal_id = ?').run(principalId);
++      this.database.prepare('DELETE FROM community_profiles WHERE principal_id = ?').run(principalId);
++      this.database.prepare('DELETE FROM training_partner_requests WHERE sender_id = ? OR receiver_id = ?').run(principalId, principalId);
+       this.database.exec('COMMIT');
+     } catch (error) {
+       this.database.exec('ROLLBACK');
+@@ -576,6 +940,16 @@ export class GymAppRepository {
+   }
+ }
+ 
++function safeJsonParseArray(jsonStr: string | null | undefined): string[] {
++  if (!jsonStr) return [];
++  try {
++    const parsed = JSON.parse(jsonStr);
++    return Array.isArray(parsed) ? parsed : [];
++  } catch {
++    return [];
++  }
++}
++
+ function isUniqueConstraint(error: unknown): boolean {
+   return error instanceof Error && /UNIQUE constraint failed/i.test(error.message);
+ }
+diff --git a/server/gymAppService.ts b/server/gymAppService.ts
+index a11b503..f90b7b3 100644
+--- a/server/gymAppService.ts
++++ b/server/gymAppService.ts
+@@ -1,5 +1,13 @@
+ import { createHash, randomBytes, randomUUID } from 'node:crypto';
+-import { GymAppRepository, type BookingAvailability, type BookingRecord, type TrainingPlanRecord, type WorkoutRecord } from './gymAppRepository';
++import {
++  GymAppRepository,
++  type BookingAvailability,
++  type BookingRecord,
++  type TrainingPlanRecord,
++  type WorkoutRecord,
++  type CommunityProfileRecord,
++  type TrainingPartnerRequestRecord,
++} from './gymAppRepository';
+ import { hashPassword, verifyPasswordOrDummy } from './password';
+ 
+ const SESSION_MAX_AGE_SECONDS = 365 * 24 * 60 * 60;
+@@ -13,6 +21,16 @@ const OCCUPANCY_RANGES: Record<string, number> = {
+ };
+ const EMAIL_PATTERN = /^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$/i;
+ 
++export function isDhbwEmail(email: string): boolean {
++  const parts = email.toLowerCase().split('@');
++  if (parts.length !== 2) return false;
++  const domain = parts[1];
++  if (!domain.endsWith('.de')) return false;
++  if (domain === 'dhbw.de' || domain.endsWith('.dhbw.de')) return true;
++  if (/^([a-z0-9\-]+\.)?dhbw-[a-z0-9\-]+\.de$/.test(domain)) return true;
++  return false;
++}
++
+ export class GymDomainError extends Error {
+   constructor(message: string, readonly status: number) {
+     super(message);
+@@ -131,6 +149,9 @@ export class GymAppService {
+   async register(currentToken: string | undefined, input: unknown): Promise<{ token: string; principalId: string; maxAgeSeconds: number }> {
+     const email = normalizeEmail(isRecord(input) ? input.email : undefined);
+     if (!email) throw new GymDomainError('a valid email address is required', 400);
++    if (!isDhbwEmail(email)) {
++      throw new GymDomainError('Nur offizielle DHBW-E-Mail-Adressen (z. B. @*.dhbw.de oder @dhbw-*.de) sind zugelassen', 400);
++    }
+     const password = validatePassword(isRecord(input) ? input.password : undefined);
+     if (this.repository.emailTaken(email)) throw new GymDomainError('an account with this email already exists', 409);
+ 
+@@ -141,14 +162,57 @@ export class GymAppService {
+       throw new GymDomainError('this session already has an account', 409);
+     }
+     const passwordHash = await hashPassword(password);
++    let sessionResult: { token: string; principalId: string; maxAgeSeconds: number };
+     if (!principalId) {
+-      const opened = this.openSession();
+-      principalId = opened.principalId;
++      sessionResult = this.openSession();
++      principalId = sessionResult.principalId;
++      this.saveLocalCredentials(principalId, email, passwordHash, nowIso);
++    } else {
+       this.saveLocalCredentials(principalId, email, passwordHash, nowIso);
+-      return opened;
++      sessionResult = this.openSession(currentToken);
+     }
+-    this.saveLocalCredentials(principalId, email, passwordHash, nowIso);
+-    return this.openSession(currentToken);
++
++    // Initialize community profile if provided or from email
++    let firstName = 'DHBW';
++    let lastNameInitial = 'S';
++    if (isRecord(input) && typeof input.firstName === 'string' && input.firstName.trim()) {
++      firstName = input.firstName.trim().slice(0, 40);
++      if (typeof input.lastNameInitial === 'string' && input.lastNameInitial.trim()) {
++        lastNameInitial = input.lastNameInitial.trim().slice(0, 1).toUpperCase();
++      }
++    } else {
++      const emailPrefix = email.split('@')[0];
++      const parts = emailPrefix.split('.');
++      if (parts[0]) firstName = parts[0].charAt(0).toUpperCase() + parts[0].slice(1);
++      if (parts[1]) lastNameInitial = parts[1].charAt(0).toUpperCase();
++    }
++
++    const trainingGoals = isRecord(input) && Array.isArray(input.trainingGoals)
++      ? input.trainingGoals.filter((g): g is string => typeof g === 'string')
++      : ['Allgemeine Fitness & Cardio'];
++
++    const preferredTimes = isRecord(input) && Array.isArray(input.preferredTimes)
++      ? input.preferredTimes.filter((t): t is string => typeof t === 'string')
++      : ['Nachmittags (15:00 - 18:00)'];
++
++    const courseOfStudy = isRecord(input) && typeof input.courseOfStudy === 'string'
++      ? input.courseOfStudy.trim().slice(0, 80)
++      : 'Campus Bad Mergentheim';
++
++    this.repository.upsertCommunityProfile({
++      principalId,
++      firstName,
++      lastNameInitial,
++      courseOfStudy,
++      trainingGoals,
++      preferredTimes,
++      interests: ['Regelmäßige Gym-Buddies'],
++      bio: '',
++      isPublicPresence: true,
++      updatedAt: nowIso,
++    });
++
++    return sessionResult;
+   }
+ 
+   async login(input: unknown, rateLimitKey: string): Promise<{ token: string; principalId: string; maxAgeSeconds: number }> {
+@@ -251,10 +315,11 @@ export class GymAppService {
+       startsAt: new Date(parsed.startMs).toISOString(),
+       endsAt: new Date(parsed.startMs + parsed.durationMinutes * 60_000).toISOString(),
+       title: parsed.title,
++      entryType: parsed.entryType,
+     };
+     const result = this.repository.createBooking(principalId, booking, new Date(timestamp).toISOString());
+     if ('duplicate' in result) throw new GymDomainError('you already have this time planned', 409);
+-    return { booking: { ...booking, status: 'planned' }, availability: result.availability };
++    return { booking: { ...booking, status: 'planned', entryType: parsed.entryType }, availability: result.availability };
+   }
+ 
+   updateBooking(principalId: string, id: string, input: unknown): BookingRecord {
+@@ -267,6 +332,7 @@ export class GymAppService {
+       startsAt: new Date(parsed.startMs).toISOString(),
+       endsAt: new Date(parsed.startMs + parsed.durationMinutes * 60_000).toISOString(),
+       title: parsed.title,
++      entryType: parsed.entryType,
+     }, new Date(timestamp).toISOString());
+     if (result === 'missing') throw new GymDomainError('planned visit not found', 404);
+     if (result === 'duplicate') throw new GymDomainError('you already have this time planned', 409);
+@@ -284,6 +350,155 @@ export class GymAppService {
+     }
+   }
+ 
++  getCommunityProfile(principalId: string): CommunityProfileRecord {
++    const existing = this.repository.getCommunityProfile(principalId);
++    if (existing) return existing;
++    const account = this.repository.getLocalAccount(principalId);
++    let defaultFirst = 'DHBW';
++    let defaultInitial = 'S';
++    if (account?.email) {
++      const namePart = account.email.split('@')[0];
++      const subParts = namePart.split('.');
++      if (subParts[0]) {
++        defaultFirst = subParts[0].charAt(0).toUpperCase() + subParts[0].slice(1);
++      }
++      if (subParts[1]) {
++        defaultInitial = subParts[1].charAt(0).toUpperCase();
++      }
++    }
++    const defaultProfile: CommunityProfileRecord = {
++      principalId,
++      firstName: defaultFirst,
++      lastNameInitial: defaultInitial,
++      courseOfStudy: 'Campus Bad Mergentheim',
++      trainingGoals: ['Allgemeine Fitness & Cardio'],
++      preferredTimes: ['Nachmittags (15:00 - 18:00)'],
++      interests: ['Regelmäßige Gym-Buddies'],
++      bio: '',
++      isPublicPresence: true,
++      updatedAt: new Date(this.now()).toISOString(),
++    };
++    this.repository.upsertCommunityProfile(defaultProfile);
++    return defaultProfile;
++  }
++
++  updateCommunityProfile(principalId: string, input: unknown): CommunityProfileRecord {
++    if (!isRecord(input)) throw new GymDomainError('invalid profile data', 400);
++    const existing = this.getCommunityProfile(principalId);
++
++    const firstName = typeof input.firstName === 'string' && input.firstName.trim().length > 0
++      ? input.firstName.trim().slice(0, 40)
++      : existing.firstName;
++
++    const lastNameInitial = typeof input.lastNameInitial === 'string' && input.lastNameInitial.trim().length > 0
++      ? input.lastNameInitial.trim().slice(0, 1).toUpperCase()
++      : existing.lastNameInitial;
++
++    const courseOfStudy = typeof input.courseOfStudy === 'string'
++      ? input.courseOfStudy.trim().slice(0, 80)
++      : existing.courseOfStudy;
++
++    const trainingGoals = Array.isArray(input.trainingGoals)
++      ? input.trainingGoals.filter((g): g is string => typeof g === 'string' && g.trim().length > 0).slice(0, 10)
++      : existing.trainingGoals;
++
++    const preferredTimes = Array.isArray(input.preferredTimes)
++      ? input.preferredTimes.filter((t): t is string => typeof t === 'string' && t.trim().length > 0).slice(0, 10)
++      : existing.preferredTimes;
++
++    const interests = Array.isArray(input.interests)
++      ? input.interests.filter((i): i is string => typeof i === 'string' && i.trim().length > 0).slice(0, 10)
++      : existing.interests;
++
++    const bio = typeof input.bio === 'string'
++      ? input.bio.trim().slice(0, 300)
++      : existing.bio;
++
++    const isPublicPresence = typeof input.isPublicPresence === 'boolean'
++      ? input.isPublicPresence
++      : existing.isPublicPresence;
++
++    const updated: CommunityProfileRecord = {
++      principalId,
++      firstName,
++      lastNameInitial,
++      courseOfStudy,
++      trainingGoals,
++      preferredTimes,
++      interests,
++      bio,
++      isPublicPresence,
++      updatedAt: new Date(this.now()).toISOString(),
++    };
++    this.repository.upsertCommunityProfile(updated);
++    return updated;
++  }
++
++  listCommunityMembers(principalId: string) {
++    this.cleanupExpiredData();
++    const nowIso = new Date(this.now()).toISOString();
++    return this.repository.listCommunityMembers(principalId, nowIso);
++  }
++
++  getCalendarEvents(principalId: string, fromValue?: unknown, toValue?: unknown) {
++    this.cleanupExpiredData();
++    const timestamp = this.now();
++    const from = isDate(fromValue) ? new Date(Date.parse(fromValue)).toISOString() : new Date(timestamp - 86400_000).toISOString();
++    const to = isDate(toValue) ? new Date(Date.parse(toValue)).toISOString() : new Date(timestamp + 30 * 86400_000).toISOString();
++    const events = this.repository.listCalendarEvents(from, to, principalId);
++    const activeCheckIns = this.repository.listActiveCheckInsWithIdentity(new Date(timestamp).toISOString(), principalId);
++    return {
++      events,
++      activeCheckIns,
++      serverTime: new Date(timestamp).toISOString(),
++    };
++  }
++
++  createPartnerRequest(senderId: string, input: unknown) {
++    if (!isRecord(input) || typeof input.receiverId !== 'string' || !input.receiverId.trim()) {
++      throw new GymDomainError('receiverId is required', 400);
++    }
++    const receiverId = input.receiverId.trim();
++    if (receiverId === senderId) {
++      throw new GymDomainError('cannot send a partner request to yourself', 400);
++    }
++    const note = typeof input.note === 'string' ? input.note.trim().slice(0, 200) : '';
++    const proposedDate = isDate(input.proposedDate) ? new Date(Date.parse(input.proposedDate)).toISOString() : null;
++    const timestamp = this.now();
++    const id = randomUUID();
++    this.repository.createPartnerRequest({
++      id,
++      senderId,
++      receiverId,
++      proposedDate,
++      note,
++      status: 'pending',
++      createdAt: new Date(timestamp).toISOString(),
++      updatedAt: new Date(timestamp).toISOString(),
++    });
++    return { id, status: 'pending' as const };
++  }
++
++  listPartnerRequests(principalId: string) {
++    this.cleanupExpiredData();
++    return this.repository.listPartnerRequests(principalId);
++  }
++
++  updatePartnerRequestStatus(principalId: string, id: string, actionInput: unknown) {
++    if (!isRecord(actionInput) || typeof actionInput.status !== 'string') {
++      throw new GymDomainError('status action is required', 400);
++    }
++    const status = actionInput.status;
++    if (status !== 'accepted' && status !== 'declined' && status !== 'cancelled') {
++      throw new GymDomainError('status must be accepted, declined, or cancelled', 400);
++    }
++    const ok = this.repository.updatePartnerRequestStatus(id, principalId, status, new Date(this.now()).toISOString());
++    if (!ok) {
++      throw new GymDomainError('partner request not found or not in pending state', 404);
++    }
++    return { id, status };
++  }
++
+   listVisits(principalId: string, fromValue: unknown, toValue: unknown) {
+     this.cleanupExpiredData();
+     const timestamp = this.now();
+@@ -411,16 +626,18 @@ export class GymAppService {
+     }
+   }
+ 
+-  private parseBookingInput(input: unknown): { startMs: number; durationMinutes: number; title: string } {
++  private parseBookingInput(input: unknown): { startMs: number; durationMinutes: number; title: string; entryType: 'planned' | 'reservation' } {
+     if (!isRecord(input) || !isDate(input.startsAt) || typeof input.durationMinutes !== 'number' ||
+         !RESERVATION_DURATIONS.has(input.durationMinutes) ||
+         (input.title !== undefined && (typeof input.title !== 'string' || input.title.length > 80))) {
+       throw new GymDomainError('booking needs a valid start time, duration and optional short title', 400);
+     }
++    const entryType = input.entryType === 'reservation' ? 'reservation' : 'planned';
+     return {
+       startMs: Date.parse(input.startsAt),
+       durationMinutes: input.durationMinutes,
+       title: typeof input.title === 'string' ? input.title.trim() : '',
++      entryType,
+     };
+   }
+ 
+diff --git a/src/features/gym/Calendar.tsx b/src/features/gym/Calendar.tsx
+index 022b2f8..3a4b0e6 100644
+--- a/src/features/gym/Calendar.tsx
++++ b/src/features/gym/Calendar.tsx
+@@ -1,13 +1,51 @@
+ import { useEffect, useMemo, useState } from 'react';
+-import { CalendarClock, Clock3, Trash2 } from 'lucide-react';
+-import type { GymAvailability, GymBooking, GymVisit, SharedBookingSlot } from '../../services/gymRepository';
+-import { formatDate, formatDateTime, formatTime } from './format';
++import {
++  BookmarkCheck,
++  CalendarCheck,
++  CalendarClock,
++  CalendarDays,
++  ChevronLeft,
++  ChevronRight,
++  Clock3,
++  Dumbbell,
++  Filter,
++  Grid,
++  Info,
++  ListFilter,
++  LogIn,
++  LogOut,
++  Plus,
++  Trash2,
++  User,
++  Users,
++} from 'lucide-react';
++import type {
++  ActiveCheckInItem,
++  CalendarEventItem,
++  GymAvailability,
++  GymSession,
++  GymVisit,
++  WorkoutLog,
++} from '../../services/gymRepository';
++import {
++  addWeeks,
++  calculateWorkoutVolume,
++  formatDate,
++  formatDateTime,
++  formatDayOfWeek,
++  formatShortDate,
++  formatTime,
++  getCalendarWeekNumber,
++  getDaysOfWeek,
++  isSameDay,
++  startOfLocalWeek,
++} from './format';
+ import { EmptyState, Field, InlineNotice, PageHeading, SectionTitle } from './components';
+ 
+ function tomorrowInputValue(): string {
+   const date = new Date();
+   date.setDate(date.getDate() + 1);
+-  date.setHours(18, 0, 0, 0);
++  date.setHours(17, 0, 0, 0);
+   const pad = (value: number) => String(value).padStart(2, '0');
+   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+ }
+@@ -23,9 +61,11 @@ function localInputToIso(value: string): string | null {
+ }
+ 
+ export function Calendar({
+-  bookings,
+-  sharedSlots,
++  session,
++  calendarEvents,
++  activeCheckIns,
+   visits,
++  workouts = [],
+   availability,
+   online,
+   busy,
+@@ -33,24 +73,120 @@ export function Calendar({
+   onCreateBooking,
+   onDeleteBooking,
+   onCheckAvailability,
++  onPresence,
++  onNavigate,
+ }: {
+-  bookings: GymBooking[];
+-  sharedSlots: SharedBookingSlot[];
++  session: GymSession | null;
++  calendarEvents: CalendarEventItem[];
++  activeCheckIns: ActiveCheckInItem[];
+   visits: GymVisit[];
++  workouts?: WorkoutLog[];
+   availability: GymAvailability | null;
+   online: boolean;
+   busy: boolean;
+   error: string | null;
+-  onCreateBooking: (input: { startsAt: string; durationMinutes: number; title?: string }) => void;
++  onCreateBooking: (input: { startsAt: string; durationMinutes: number; title?: string; entryType?: 'planned' | 'reservation' }) => void;
+   onDeleteBooking: (id: string) => void;
+   onCheckAvailability: (startAt: string, duration: number) => void;
++  onPresence: (present: boolean) => void;
++  onNavigate?: (page: 'dashboard' | 'calendar' | 'community' | 'training' | 'progress' | 'profile') => void;
+ }) {
++  const isCheckedIn = Boolean(session?.checkedInAt);
+   const [startsAt, setStartsAt] = useState(tomorrowInputValue);
+   const [duration, setDuration] = useState(60);
+   const [title, setTitle] = useState('');
++  const [entryType, setEntryType] = useState<'planned' | 'reservation'>('planned');
++  const [typeFilter, setTypeFilter] = useState<'all' | 'planned' | 'reservation' | 'checked_in'>('all');
++
++  // Weekly View State
++  const [viewMode, setViewMode] = useState<'week' | 'list'>('week');
++  const [currentWeekDate, setCurrentWeekDate] = useState<Date>(() => new Date());
++  const [selectedDay, setSelectedDay] = useState<Date>(() => new Date());
++  const [weekFilter, setWeekFilter] = useState<'all' | 'mine' | 'community'>('all');
++
+   const startsAtIso = localInputToIso(startsAt);
+-  const upcoming = useMemo(() => bookings.filter((booking) => Date.parse(booking.endsAt) >= Date.now()), [bookings]);
+-  const history = useMemo(() => visits.filter((visit) => visit.checkedOutAt !== null && Date.parse(visit.checkedInAt) < Date.now()), [visits]);
++
++  // Group events into today, tomorrow, and future for list view
++  const nowMs = Date.now();
++  const upcomingEvents = useMemo(() => {
++    return calendarEvents.filter((event) => Date.parse(event.endsAt) >= nowMs);
++  }, [calendarEvents, nowMs]);
++
++  const filteredEvents = useMemo(() => {
++    if (typeFilter === 'all') return upcomingEvents;
++    if (typeFilter === 'checked_in') return [];
++    return upcomingEvents.filter((event) => event.entryType === typeFilter);
++  }, [upcomingEvents, typeFilter]);
++
++  const history = useMemo(
++    () => visits.filter((visit) => visit.checkedOutAt !== null && Date.parse(visit.checkedInAt) < Date.now()),
++    [visits],
++  );
++
++  // Week View Calculations
++  const startOfWeek = useMemo(() => startOfLocalWeek(currentWeekDate), [currentWeekDate]);
++  const endOfWeek = useMemo(() => addWeeks(startOfWeek, 1), [startOfWeek]);
++  const weekDays = useMemo(() => getDaysOfWeek(startOfWeek), [startOfWeek]);
++  const kwNumber = useMemo(() => getCalendarWeekNumber(currentWeekDate), [currentWeekDate]);
++
++  // Is current week showing the real current week?
++  const isCurrentWeek = useMemo(() => {
++    return isSameDay(startOfWeek, startOfLocalWeek(new Date()));
++  }, [startOfWeek]);
++
++  // Events & Workouts for the selected week
++  const weekEvents = useMemo(() => {
++    const fromTime = startOfWeek.getTime();
++    const toTime = endOfWeek.getTime();
++    return calendarEvents.filter((e) => {
++      const t = new Date(e.startsAt).getTime();
++      return t >= fromTime && t < toTime;
++    });
++  }, [calendarEvents, startOfWeek, endOfWeek]);
++
++  const weekWorkouts = useMemo(() => {
++    const fromTime = startOfWeek.getTime();
++    const toTime = endOfWeek.getTime();
++    return workouts.filter((w) => {
++      const t = new Date(w.occurredAt).getTime();
++      return t >= fromTime && t < toTime;
++    });
++  }, [workouts, startOfWeek, endOfWeek]);
++
++  // Week statistics
++  const weekStats = useMemo(() => {
++    const myEvents = weekEvents.filter((e) => e.isMine);
++    const myPlanned = myEvents.filter((e) => e.entryType === 'planned').length;
++    const myReservations = myEvents.filter((e) => e.entryType === 'reservation').length;
++    const completedWorkouts = weekWorkouts.length;
++    const communityEvents = weekEvents.filter((e) => !e.isMine);
++    const communityNames = new Set(communityEvents.map((e) => e.userName || 'Student'));
++
++    return {
++      totalMyUnits: myPlanned + myReservations + completedWorkouts,
++      completedWorkouts,
++      plannedUnits: myPlanned + myReservations,
++      communityCount: communityNames.size,
++      totalVolumeKg: calculateWorkoutVolume(weekWorkouts),
++    };
++  }, [weekEvents, weekWorkouts]);
++
++  // Selected Day items breakdown
++  const selectedDayEvents = useMemo(() => {
++    return calendarEvents.filter((e) => isSameDay(e.startsAt, selectedDay));
++  }, [calendarEvents, selectedDay]);
++
++  const selectedDayWorkouts = useMemo(() => {
++    return workouts.filter((w) => isSameDay(w.occurredAt, selectedDay));
++  }, [workouts, selectedDay]);
++
++  const mySelectedDayEvents = useMemo(() => {
++    return selectedDayEvents.filter((e) => e.isMine);
++  }, [selectedDayEvents]);
++
++  const communitySelectedDayEvents = useMemo(() => {
++    return selectedDayEvents.filter((e) => !e.isMine);
++  }, [selectedDayEvents]);
+ 
+   useEffect(() => {
+     if (!startsAtIso || !online) return;
+@@ -61,42 +197,738 @@ export function Calendar({
+   const create = (event: React.FormEvent<HTMLFormElement>) => {
+     event.preventDefault();
+     if (!startsAtIso) return;
+-    onCreateBooking({ startsAt: startsAtIso, durationMinutes: duration, title: title.trim() });
++    onCreateBooking({
++      startsAt: startsAtIso,
++      durationMinutes: duration,
++      title: title.trim(),
++      entryType,
++    });
++  };
++
++  const handleSelectDayForPlanning = (day: Date) => {
++    setSelectedDay(day);
++    const target = new Date(day);
++    target.setHours(17, 0, 0, 0);
++    setStartsAt(localDateTimeValue(target));
++    const formElement = document.getElementById('booking-form-section');
++    if (formElement) {
++      formElement.scrollIntoView({ behavior: 'smooth' });
++    }
+   };
+ 
+   return (
+     <>
+-      <PageHeading eyebrow="PLANUNG" title="Kalender" description="Plane deine Trainingszeit und behalte vergangene Besuche im Blick." />
++      <PageHeading
++        eyebrow="GEMEINSAME ANWESENHEIT"
++        title="Kalender & Trainingspläne"
++        description="Gemeinsame Trainingszeiten einsehen, eigene Trainingspläne im Wochenkontext planen und live im Gym einchecken."
++      />
++
++      {error && <InlineNotice tone="error">{error}</InlineNotice>}
++
++      {/* Live Check-In Action Bar */}
++      <section className={`surface live-presence-bar ${isCheckedIn ? 'is-checked-in' : ''}`}>
++        <div className="live-presence-info">
++          <div className="flex items-center gap-2">
++            <span className={`live-pulse-indicator ${isCheckedIn ? 'active' : ''}`} aria-hidden="true" />
++            <span className="live-title">
++              {isCheckedIn ? 'Du bist derzeit im Gym eingecheckt' : 'Aktuell nicht vor Ort'}
++            </span>
++          </div>
++          <p className="live-subtitle">
++            {isCheckedIn && session?.checkedInAt
++              ? `Eingecheckt seit ${formatTime(session.checkedInAt)} · Endet automatisch nach ${session.maxCheckInHours} Stunden`
++              : 'Aktualisiere die Auslastung für andere Studierende mit einem Klick bei deiner Ankunft.'}
++          </p>
++        </div>
++        <div className="live-presence-action">
++          <button
++            type="button"
++            className={`button ${isCheckedIn ? 'button-secondary' : 'button-primary'}`}
++            disabled={!online || busy}
++            onClick={() => onPresence(!isCheckedIn)}
++          >
++            {isCheckedIn ? (
++              <>
++                <LogOut size={16} aria-hidden="true" />
++                <span>Jetzt auschecken</span>
++              </>
++            ) : (
++              <>
++                <LogIn size={16} aria-hidden="true" />
++                <span>Jetzt im Gym einchecken</span>
++              </>
++            )}
++          </button>
++        </div>
++      </section>
++
++      {/* Currently checked-in students (if any) */}
++      {activeCheckIns.length > 0 && (
++        <section className="surface active-checkins-panel">
++          <div className="flex items-center justify-between gap-4 mb-3">
++            <div className="flex items-center gap-2">
++              <span className="live-dot" aria-hidden="true" />
++              <h2 className="text-base font-semibold text-slate-100">
++                Gerade vor Ort im Gym ({activeCheckIns.length})
++              </h2>
++            </div>
++            <span className="text-xs text-slate-400">Live-Anwesenheit</span>
++          </div>
++
++          <div className="active-members-chip-list">
++            {activeCheckIns.map((ci) => (
++              <div key={ci.id} className={`active-member-chip ${ci.isMine ? 'is-mine' : ''}`}>
++                <div className="chip-avatar">{ci.userName[0]}</div>
++                <div className="chip-text">
++                  <span className="chip-name">
++                    {ci.userName} {ci.isMine && '(Du)'}
++                  </span>
++                  <span className="chip-sub">Seit {formatTime(ci.checkedInAt)}</span>
++                </div>
++              </div>
++            ))}
++          </div>
++        </section>
++      )}
++
++      {/* Calendar Header with View-Mode Switcher */}
++      <div className="calendar-view-header">
++        <div className="view-mode-tabs" role="tablist" aria-label="Kalender-Ansicht">
++          <button
++            type="button"
++            role="tab"
++            aria-selected={viewMode === 'week'}
++            className={`view-mode-btn ${viewMode === 'week' ? 'is-active' : ''}`}
++            onClick={() => setViewMode('week')}
++          >
++            <CalendarDays size={16} aria-hidden="true" />
++            <span>Wochenansicht</span>
++          </button>
++          <button
++            type="button"
++            role="tab"
++            aria-selected={viewMode === 'list'}
++            className={`view-mode-btn ${viewMode === 'list' ? 'is-active' : ''}`}
++            onClick={() => setViewMode('list')}
++          >
++            <ListFilter size={16} aria-hidden="true" />
++            <span>Listenansicht</span>
++          </button>
++        </div>
++
++        {viewMode === 'week' && (
++          <div className="flex items-center gap-2">
++            <button
++              type="button"
++              className={`filter-tab ${weekFilter === 'all' ? 'is-active' : ''}`}
++              onClick={() => setWeekFilter('all')}
++            >
++              Alle Einträge
++            </button>
++            <button
++              type="button"
++              className={`filter-tab ${weekFilter === 'mine' ? 'is-active' : ''}`}
++              onClick={() => setWeekFilter('mine')}
++            >
++              Meine Einheiten
++            </button>
++            <button
++              type="button"
++              className={`filter-tab ${weekFilter === 'community' ? 'is-active' : ''}`}
++              onClick={() => setWeekFilter('community')}
++            >
++              Community
++            </button>
++          </div>
++        )}
++      </div>
++
++      {/* VIEW MODE 1: WOCHENANSICHT (WEEKLY VIEW) */}
++      {viewMode === 'week' && (
++        <section className="surface week-panel" aria-label="Wochenansicht Trainingskalender">
++          {/* Week Toolbar: Navigation, KW Badge, and Summary Stats */}
++          <div className="week-toolbar">
++            <div className="week-nav-group">
++              <button
++                type="button"
++                className="week-nav-btn"
++                aria-label="Vorherige Woche"
++                onClick={() => setCurrentWeekDate((prev) => addWeeks(prev, -1))}
++              >
++                <ChevronLeft size={18} aria-hidden="true" />
++              </button>
++
++              <button
++                type="button"
++                className={`week-today-btn ${isCurrentWeek ? 'is-current' : ''}`}
++                onClick={() => {
++                  const now = new Date();
++                  setCurrentWeekDate(now);
++                  setSelectedDay(now);
++                }}
++              >
++                Heute
++              </button>
++
++              <button
++                type="button"
++                className="week-nav-btn"
++                aria-label="Nächste Woche"
++                onClick={() => setCurrentWeekDate((prev) => addWeeks(prev, 1))}
++              >
++                <ChevronRight size={18} aria-hidden="true" />
++              </button>
++
++              <div className="week-kw-badge">
++                <span>KW {kwNumber}</span>
++                <small>· {formatShortDate(startOfWeek)} – {formatShortDate(addWeeks(startOfWeek, 1))}</small>
++              </div>
++            </div>
++
++            {/* Quick Stats Pills for the Week */}
++            <div className="week-quick-stats">
++              <div className="week-stat-pill pill-planned">
++                <CalendarCheck size={14} aria-hidden="true" />
++                <span><strong>{weekStats.plannedUnits}</strong> geplant</span>
++              </div>
++              <div className="week-stat-pill pill-workout">
++                <Dumbbell size={14} aria-hidden="true" />
++                <span><strong>{weekStats.completedWorkouts}</strong> Workouts</span>
++              </div>
++              {weekStats.communityCount > 0 && (
++                <div className="week-stat-pill pill-community">
++                  <Users size={14} aria-hidden="true" />
++                  <span><strong>{weekStats.communityCount}</strong> Studierende</span>
++                </div>
++              )}
++            </div>
++          </div>
++
++          {/* 7-Day Grid: Monday through Sunday */}
++          <div className="week-grid-container" role="grid" aria-label="Wochenübersicht Mo bis So">
++            {weekDays.map((day) => {
++              const dayIsToday = isSameDay(day, new Date());
++              const dayIsSelected = isSameDay(day, selectedDay);
++
++              // Events on this day
++              const dayCalEvents = calendarEvents.filter((e) => isSameDay(e.startsAt, day));
++              const dayWorkouts = workouts.filter((w) => isSameDay(w.occurredAt, day));
++
++              // Apply week filter
++              const filteredCalEvents = dayCalEvents.filter((e) => {
++                if (weekFilter === 'mine') return e.isMine;
++                if (weekFilter === 'community') return !e.isMine;
++                return true;
++              });
++
++              const filteredDayWorkouts = weekFilter === 'community' ? [] : dayWorkouts;
++
++              const totalItems = filteredCalEvents.length + filteredDayWorkouts.length;
++
++              return (
++                <div
++                  key={day.toISOString()}
++                  className={`week-day-col ${dayIsToday ? 'is-today' : ''} ${dayIsSelected ? 'is-selected' : ''}`}
++                  onClick={() => setSelectedDay(day)}
++                  role="gridcell"
++                  tabIndex={0}
++                  onKeyDown={(e) => {
++                    if (e.key === 'Enter' || e.key === ' ') {
++                      e.preventDefault();
++                      setSelectedDay(day);
++                    }
++                  }}
++                  aria-label={`${formatDayOfWeek(day, 'long')}, ${formatShortDate(day)}: ${totalItems} Aktivitäten`}
++                >
++                  {/* Day Header */}
++                  <div className="week-day-header">
++                    <div className="week-day-label-group">
++                      <span className="week-day-name">{formatDayOfWeek(day, 'short')}</span>
++                      <span className="week-day-number">{day.getDate()}</span>
++                    </div>
++                    {dayIsToday && <span className="week-day-today-tag">Heute</span>}
++                  </div>
++
++                  {/* Day Events Container */}
++                  <div className="week-day-events-list">
++                    {/* Logged Workouts for this day */}
++                    {filteredDayWorkouts.map((workout) => (
++                      <div
++                        key={workout.id}
++                        className="week-event-card week-card-workout"
++                        title={`${workout.title} · ${workout.exercises.length} Übungen`}
++                      >
++                        <div className="week-event-topline">
++                          <span className="week-event-badge-label">
++                            <Dumbbell size={11} className="week-event-icon" aria-hidden="true" />
++                            <span>Workout</span>
++                          </span>
++                        </div>
++                        <strong className="week-event-title">{workout.title}</strong>
++                        <span className="week-event-sub">
++                          {workout.exercises.length} Übungen
++                        </span>
++                      </div>
++                    ))}
++
++                    {/* Planned Sessions & Reservations */}
++                    {filteredCalEvents.map((event) => {
++                      const isPlanned = event.entryType === 'planned';
++                      const isReservation = event.entryType === 'reservation';
++
++                      let cardVariant = 'week-card-community';
++                      if (event.isMine) {
++                        cardVariant = isPlanned ? 'week-card-planned' : 'week-card-reservation';
++                      }
++
++                      return (
++                        <div
++                          key={event.id}
++                          className={`week-event-card ${cardVariant}`}
++                          title={`${event.title} (${formatTime(event.startsAt)} - ${formatTime(event.endsAt)})`}
++                        >
++                          <div className="week-event-topline">
++                            <span className="week-event-badge-label">
++                              {isPlanned ? (
++                                <CalendarClock size={11} className="week-event-icon" aria-hidden="true" />
++                              ) : (
++                                <BookmarkCheck size={11} className="week-event-icon" aria-hidden="true" />
++                              )}
++                              <span>{isPlanned ? 'Geplant' : 'Reserviert'}</span>
++                            </span>
++                            <span className="week-event-time">{formatTime(event.startsAt)}</span>
++                          </div>
++                          <strong className="week-event-title">{event.title}</strong>
++                          <span className="week-event-sub">
++                            {event.isMine ? 'Dein Termin' : (event.userName || 'Student')}
++                          </span>
++                        </div>
++                      );
++                    })}
++
++                    {/* Empty Day Indicator */}
++                    {totalItems === 0 && (
++                      <div className="week-day-empty-placeholder">
++                        <span>Kein Training</span>
++                      </div>
++                    )}
++                  </div>
++
++                  {/* Quick Add Button for this day */}
++                  <div className="week-day-add-action">
++                    <button
++                      type="button"
++                      className="week-add-button"
++                      onClick={(e) => {
++                        e.stopPropagation();
++                        handleSelectDayForPlanning(day);
++                      }}
++                      title={`Training für ${formatDayOfWeek(day, 'long')}, ${formatShortDate(day)} planen`}
++                    >
++                      <Plus size={12} aria-hidden="true" />
++                      <span>Planen</span>
++                    </button>
++                  </div>
++                </div>
++              );
++            })}
++          </div>
++
++          {/* Selected Day Inspector Panel (Tages-Fokus & Detailansicht) */}
++          <div className="week-day-inspector">
++            <div className="inspector-header">
++              <div className="inspector-date-title">
++                <CalendarDays size={20} className="text-emerald-400" aria-hidden="true" />
++                <h3>
++                  Tagesansicht: {formatDate(selectedDay.toISOString())}
++                  {isSameDay(selectedDay, new Date()) && ' (Heute)'}
++                </h3>
++              </div>
++              <button
++                type="button"
++                className="button button-primary"
++                onClick={() => handleSelectDayForPlanning(selectedDay)}
++              >
++                <Plus size={15} aria-hidden="true" />
++                <span>Für diesen Tag planen</span>
++              </button>
++            </div>
++
++            <div className="inspector-grid">
++              {/* Column 1: Own Planned Sessions & Reservations */}
++              <div className="inspector-section">
++                <div className="inspector-section-title">
++                  <span>Geplante Besuche & Reservierungen</span>
++                  <span className="text-xs text-slate-400">({mySelectedDayEvents.length})</span>
++                </div>
++
++                {mySelectedDayEvents.length > 0 ? (
++                  mySelectedDayEvents.map((ev) => (
++                    <div
++                      key={ev.id}
++                      className={`inspector-item-card ${ev.entryType === 'planned' ? 'is-planned' : 'is-reservation'}`}
++                    >
++                      <div className="inspector-item-top">
++                        <strong className="inspector-item-name">{ev.title}</strong>
++                        <span className={`entry-badge ${ev.entryType === 'planned' ? 'badge-planned' : 'badge-reservation'}`}>
++                          {ev.entryType === 'planned' ? 'Geplant' : 'Reserviert'}
++                        </span>
++                      </div>
++                      <div className="event-metadata">
++                        <Clock3 size={12} />
++                        <span>{formatTime(ev.startsAt)} – {formatTime(ev.endsAt)}</span>
++                      </div>
++                      <div className="flex justify-end mt-2">
++                        <button
++                          type="button"
++                          className="icon-button danger-hover"
++                          aria-label={`Eintrag ${ev.title} löschen`}
++                          onClick={() => {
++                            if (window.confirm('Diesen Kalendereintrag wirklich entfernen?')) {
++                              onDeleteBooking(ev.id);
++                            }
++                          }}
++                        >
++                          <Trash2 size={15} aria-hidden="true" />
++                        </button>
++                      </div>
++                    </div>
++                  ))
++                ) : (
++                  <p className="text-xs text-slate-400 py-3">
++                    Keine eigenen Buchungen an diesem Tag eingetragen.
++                  </p>
++                )}
++              </div>
++
++              {/* Column 2: Logged Workouts & Exercises */}
++              <div className="inspector-section">
++                <div className="inspector-section-title">
++                  <span>Trainingspläne & Workouts</span>
++                  <span className="text-xs text-slate-400">({selectedDayWorkouts.length})</span>
++                </div>
++
++                {selectedDayWorkouts.length > 0 ? (
++                  selectedDayWorkouts.map((workout) => (
++                    <div key={workout.id} className="inspector-item-card is-workout">
++                      <div className="inspector-item-top">
++                        <strong className="inspector-item-name">{workout.title}</strong>
++                        <span className="entry-badge badge-planned">Absolviert</span>
++                      </div>
++                      <div className="event-metadata">
++                        <Dumbbell size={12} />
++                        <span>{workout.exercises.length} Übungen erfasst</span>
++                      </div>
++
++                      {/* Exercises breakdown */}
++                      <div className="inspector-exercise-list">
++                        {workout.exercises.map((ex, idx) => (
++                          <div key={idx} className="inspector-exercise-row">
++                            <span>{ex.name}</span>
++                            <span>{ex.sets.length} Sätze · {ex.sets[0]?.weightKg ?? 0} kg</span>
++                          </div>
++                        ))}
++                      </div>
++                    </div>
++                  ))
++                ) : (
++                  <div className="py-2">
++                    <p className="text-xs text-slate-400 mb-2">
++                      Noch keine Workout-Aufzeichnungen für diesen Tag vorhanden.
++                    </p>
++                    {onNavigate && (
++                      <button
++                        type="button"
++                        className="text-action"
++                        onClick={() => onNavigate('training')}
++                      >
++                        <Plus size={13} aria-hidden="true" />
++                        <span>Im Training-Bereich erfassen</span>
++                      </button>
++                    )}
++                  </div>
++                )}
++              </div>
++
++              {/* Column 3: Campus Community Activity */}
++              <div className="inspector-section">
++                <div className="inspector-section-title">
++                  <span>Campus-Community vor Ort</span>
++                  <span className="text-xs text-slate-400">({communitySelectedDayEvents.length})</span>
++                </div>
++
++                {communitySelectedDayEvents.length > 0 ? (
++                  communitySelectedDayEvents.map((ev) => (
++                    <div key={ev.id} className="inspector-item-card is-community">
++                      <div className="inspector-item-top">
++                        <strong className="inspector-item-name">
++                          {ev.userName || 'DHBW Student'}
++                        </strong>
++                        <span className="text-xs text-slate-400">
++                          {formatTime(ev.startsAt)} – {formatTime(ev.endsAt)}
++                        </span>
++                      </div>
++                      {ev.courseOfStudy && (
++                        <p className="text-xs text-slate-400">
++                          Studiengang: {ev.courseOfStudy}
++                        </p>
++                      )}
++                      {ev.title && (
++                        <p className="text-xs text-slate-300">
++                          Fokus: {ev.title}
++                        </p>
++                      )}
++                      {ev.userGoals && ev.userGoals.length > 0 && (
++                        <div className="event-goals-row mt-1">
++                          {ev.userGoals.map((g) => (
++                            <span key={g} className="micro-tag">
++                              {g}
++                            </span>
++                          ))}
++                        </div>
++                      )}
++                    </div>
++                  ))
++                ) : (
++                  <p className="text-xs text-slate-400 py-3">
++                    Keine weiteren Studierenden mit öffentlicher Sichtbarkeit für diesen Tag eingetragen.
++                  </p>
++                )}
++              </div>
++            </div>
++          </div>
++        </section>
++      )}
++
++      {/* Booking Form and List / Calendar Panels */}
+       <div className="calendar-grid">
+-        <section className="surface calendar-booking-form">
+-          <SectionTitle title="Trainingszeit reservieren" />
++        {/* Booking Form */}
++        <section id="booking-form-section" className="surface calendar-booking-form">
++          <SectionTitle title="Trainingszeit eintragen" />
+           <form onSubmit={create} className="stack-form">
+-            <Field label="Datum und Uhrzeit"><input className="text-input" type="datetime-local" value={startsAt} min={localDateTimeValue(new Date())} onChange={(event) => setStartsAt(event.target.value)} required /></Field>
+-            <Field label="Dauer"><select className="text-input" value={duration} onChange={(event) => setDuration(Number(event.target.value))}><option value={30}>30 Minuten</option><option value={60}>1 Stunde</option><option value={90}>1,5 Stunden</option><option value={120}>2 Stunden</option></select></Field>
+-            <Field label="Titel (optional)"><input className="text-input" maxLength={80} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="z. B. Oberkörper" /></Field>
+-            {availability && <InlineNotice>{availability.reserved === 0 ? 'Für diese Zeit gibt es noch keine geteilten Reservierungen.' : `${availability.reserved} Reservierung${availability.reserved === 1 ? '' : 'en'} in diesem Zeitraum. Reservierungen sind jederzeit möglich, es gibt keine Teilnehmergrenze.`}</InlineNotice>}
+-            {error && <InlineNotice tone="error">{error}</InlineNotice>}
+-            <button className="button button-primary full-width" type="submit" disabled={!online || busy}><CalendarClock size={17} aria-hidden="true" />Zeit reservieren</button>
+-            <p className="field-hint">App-Reservierung · nicht mit dem DHBW-Türsystem oder einer Zutrittsberechtigung verbunden.</p>
++            <Field label="Art des Eintrags">
++              <div className="entry-type-selector" role="radiogroup">
++                <button
++                  type="button"
++                  className={`entry-type-btn ${entryType === 'planned' ? 'is-active type-planned' : ''}`}
++                  onClick={() => setEntryType('planned')}
++                >
++                  <CalendarClock size={16} aria-hidden="true" />
++                  <span>Geplante Anwesenheit</span>
++                </button>
++                <button
++                  type="button"
++                  className={`entry-type-btn ${entryType === 'reservation' ? 'is-active type-reservation' : ''}`}
++                  onClick={() => setEntryType('reservation')}
++                >
++                  <BookmarkCheck size={16} aria-hidden="true" />
++                  <span>Feste Reservierung</span>
++                </button>
++              </div>
++            </Field>
++
++            <Field label="Datum und Uhrzeit">
++              <input
++                className="text-input"
++                type="datetime-local"
++                value={startsAt}
++                min={localDateTimeValue(new Date())}
++                onChange={(event) => setStartsAt(event.target.value)}
++                required
++              />
++            </Field>
++
++            <Field label="Dauer">
++              <select
++                className="text-input"
++                value={duration}
++                onChange={(event) => setDuration(Number(event.target.value))}
++              >
++                <option value={30}>30 Minuten</option>
++                <option value={60}>1 Stunde</option>
++                <option value={90}>1,5 Stunden (Standard)</option>
++                <option value={120}>2 Stunden</option>
++              </select>
++            </Field>
++
++            <Field label="Schwerpunkt / Titel (optional)">
++              <input
++                className="text-input"
++                maxLength={80}
++                value={title}
++                onChange={(event) => setTitle(event.target.value)}
++                placeholder="z. B. Push-Training / Brust & Trizeps"
++              />
++            </Field>
++
++            {availability && (
++              <InlineNotice>
++                {availability.reserved === 0
++                  ? 'In diesem Zeitraum sind noch keine weiteren Studierenden eingetragen.'
++                  : `${availability.reserved} weitere Studierende in diesem Zeitfenster geplant. Du kannst dich jederzeit eintragen (keine Beschränkung).`}
++              </InlineNotice>
++            )}
++
++            <button
++              className="button button-primary full-width"
++              type="submit"
++              disabled={!online || busy}
++            >
++              <CalendarCheck size={17} aria-hidden="true" />
++              <span>
++                {entryType === 'planned' ? 'Anwesenheit ankündigen' : 'Trainingszeit reservieren'}
++              </span>
++            </button>
++            <p className="field-hint">
++              Freiwillige Zeitfenster-Angabe · Dient der Community-Transparenz ohne Schrankensperren.
++            </p>
+           </form>
+         </section>
+ 
++        {/* Shared Calendar Feed (LIST VIEW or Side Overview) */}
+         <section className="surface calendar-list-panel">
+-          <SectionTitle title="Deine nächsten Termine" />
+-          {upcoming.length ? <ul className="event-list">{upcoming.map((booking) => <li key={booking.id} className="event-row"><span className="event-date-icon"><CalendarClock size={17} aria-hidden="true" /></span><div className="event-content"><strong>{booking.title || 'Training im Gym'}</strong><span>{formatDateTime(booking.startsAt)} · {formatTime(booking.endsAt)}</span></div><button type="button" className="icon-button danger-hover" aria-label={`Reservierung ${booking.title || 'Training'} stornieren`} disabled={busy} onClick={() => { if (window.confirm('Diese Reservierung wirklich stornieren?')) onDeleteBooking(booking.id); }}><Trash2 size={17} aria-hidden="true" /></button></li>)}</ul> : <EmptyState title="Noch keine Termine" description="Deine Reservierungen erscheinen hier." />}
++          <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
++            <SectionTitle title="Gemeinsamer Trainingskalender" />
++            {/* Filter buttons */}
++            <div className="calendar-type-filters">
++              <button
++                type="button"
++                className={`filter-tab ${typeFilter === 'all' ? 'is-active' : ''}`}
++                onClick={() => setTypeFilter('all')}
++              >
++                Alle ({upcomingEvents.length})
++              </button>
++              <button
++                type="button"
++                className={`filter-tab ${typeFilter === 'planned' ? 'is-active' : ''}`}
++                onClick={() => setTypeFilter('planned')}
++              >
++                Geplant
++              </button>
++              <button
++                type="button"
++                className={`filter-tab ${typeFilter === 'reservation' ? 'is-active' : ''}`}
++                onClick={() => setTypeFilter('reservation')}
++              >
++                Reserviert
++              </button>
++            </div>
++          </div>
++
++          <p className="muted-copy section-intro">
++            Übersicht aller anstehenden Einträge. Namen werden nur angezeigt, wenn Studierende die
++            Sichtbarkeit aktiviert haben.
++          </p>
++
++          {filteredEvents.length ? (
++            <ul className="event-list">
++              {filteredEvents.map((event) => {
++                const isPlanned = event.entryType === 'planned';
++                return (
++                  <li
++                    key={event.id}
++                    className={`event-row calendar-event-card ${isPlanned ? 'border-planned' : 'border-reservation'} ${
++                      event.isMine ? 'is-my-event' : ''
++                    }`}
++                  >
++                    <span
++                      className={`event-date-icon ${isPlanned ? 'icon-planned' : 'icon-reservation'}`}
++                    >
++                      {isPlanned ? (
++                        <CalendarClock size={17} aria-hidden="true" />
++                      ) : (
++                        <BookmarkCheck size={17} aria-hidden="true" />
++                      )}
++                    </span>
++
++                    <div className="event-content">
++                      <div className="flex items-center gap-2 flex-wrap">
++                        <strong>{event.title}</strong>
++                        <span className={`entry-badge ${isPlanned ? 'badge-planned' : 'badge-reservation'}`}>
++                          {isPlanned ? 'Geplant' : 'Reserviert'}
++                        </span>
++                        {event.isMine && <span className="self-tag">Dein Eintrag</span>}
++                      </div>
++
++                      <div className="event-metadata">
++                        <span className="event-time">
++                          {formatDateTime(event.startsAt)} – {formatTime(event.endsAt)}
++                        </span>
++                        <span aria-hidden="true">·</span>
++                        <span className="event-user">
++                          <User size={13} className="inline mr-1 opacity-70" />
++                          {event.userName || 'DHBW Student'}
++                          {event.courseOfStudy && ` (${event.courseOfStudy})`}
++                        </span>
++                      </div>
++
++                      {event.userGoals && event.userGoals.length > 0 && (
++                        <div className="event-goals-row">
++                          {event.userGoals.slice(0, 2).map((g) => (
++                            <span key={g} className="micro-tag">
++                              {g}
++                            </span>
++                          ))}
++                        </div>
++                      )}
++                    </div>
++
++                    {event.isMine && (
++                      <button
++                        type="button"
++                        className="icon-button danger-hover"
++                        aria-label={`Eintrag ${event.title} stornieren`}
++                        disabled={busy}
++                        onClick={() => {
++                          if (window.confirm('Diesen Kalendereintrag wirklich entfernen?')) {
++                            onDeleteBooking(event.id);
++                          }
++                        }}
++                      >
++                        <Trash2 size={17} aria-hidden="true" />
++                      </button>
++                    )}
++                  </li>
++                );
++              })}
++            </ul>
++          ) : (
++            <EmptyState
++              title="Keine anstehenden Einträge"
++              description="Für diesen Filter liegen aktuell keine geplanten Trainingszeiten vor. Trage deine eigene Zeit ein!"
++            />
++          )}
+         </section>
+       </div>
+ 
++      {/* History Grid */}
+       <div className="calendar-grid calendar-lower-grid">
+         <section className="surface calendar-list-panel">
+-          <SectionTitle title="Gemeinsame Reservierungen" />
+-          <p className="muted-copy section-intro">Es werden nur Zeitfenster und Anzahl angezeigt, keine Namen.</p>
+-          {sharedSlots.length ? <ul className="event-list">{sharedSlots.slice(0, 10).map((slot) => <li key={`${slot.startsAt}-${slot.endsAt}`} className="event-row"><span className="event-date-icon"><Clock3 size={17} aria-hidden="true" /></span><div className="event-content"><strong>{formatDateTime(slot.startsAt)}</strong><span>{slot.reserved} Reservierung{slot.reserved === 1 ? '' : 'en'}</span></div></li>)}</ul> : <p className="muted-copy">Im gewählten Zeitraum gibt es noch keine Reservierungen.</p>}
+-        </section>
+-        <section className="surface calendar-list-panel">
+-          <SectionTitle title="Vergangene Gym-Besuche" />
+-          <p className="muted-copy section-intro">Besuche werden 90 Tage gespeichert.</p>
+-          {history.length ? <ul className="event-list">{history.slice(0, 8).map((visit) => <li key={visit.id} className="event-row"><span className="event-date-icon"><Clock3 size={17} aria-hidden="true" /></span><div className="event-content"><strong>{formatDate(visit.checkedInAt)}</strong><span>{formatTime(visit.checkedInAt)}{visit.checkedOutAt ? ` – ${formatTime(visit.checkedOutAt)}` : ' · Check-out noch offen'}</span></div></li>)}</ul> : <p className="muted-copy">Nach deinem ersten Check-in findest du deine Besuche hier.</p>}
++          <SectionTitle title="Vergangene eigene Besuche" />
++          <p className="muted-copy section-intro">
++            Historie deiner manuell gemeldeten Trainingseinheiten (90 Tage Aufbewahrung).
++          </p>
++          {history.length ? (
++            <ul className="event-list">
++              {history.slice(0, 6).map((visit) => (
++                <li key={visit.id} className="event-row">
++                  <span className="event-date-icon">
++                    <Clock3 size={17} aria-hidden="true" />
++                  </span>
++                  <div className="event-content">
++                    <strong>{formatDate(visit.checkedInAt)}</strong>
++                    <span>
++                      {formatTime(visit.checkedInAt)}
++                      {visit.checkedOutAt ? ` – ${formatTime(visit.checkedOutAt)}` : ' · Offen'}
++                    </span>
++                  </div>
++                </li>
++              ))}
++            </ul>
++          ) : (
++            <p className="muted-copy">Nach deinem ersten Check-in findest du deine Besuche hier.</p>
++          )}
+         </section>
+       </div>
+     </>
+diff --git a/src/features/gym/Community.tsx b/src/features/gym/Community.tsx
+new file mode 100644
+index 0000000..cac169c
+--- /dev/null
++++ b/src/features/gym/Community.tsx
+@@ -0,0 +1,472 @@
++import { useMemo, useState } from 'react';
++import {
++  CalendarClock,
++  Check,
++  Clock,
++  Dumbbell,
++  Filter,
++  MessageSquare,
++  Search,
++  Send,
++  UserCheck,
++  UserPlus,
++  Users,
++  X,
++} from 'lucide-react';
++import type { CommunityMember, CommunityProfile, TrainingPartnerRequest } from '../../services/gymRepository';
++import { formatDateTime } from './format';
++import { EmptyState, Field, InlineNotice, PageHeading, SectionTitle } from './components';
++
++export function Community({
++  members,
++  requests,
++  myProfile,
++  online,
++  busy,
++  error,
++  onSendRequest,
++  onRespondRequest,
++  onNavigateToProfile,
++}: {
++  members: CommunityMember[];
++  requests: TrainingPartnerRequest[];
++  myProfile: CommunityProfile | null;
++  online: boolean;
++  busy: boolean;
++  error: string | null;
++  onSendRequest: (receiverId: string, note?: string, proposedDate?: string) => Promise<void>;
++  onRespondRequest: (id: string, status: 'accepted' | 'declined' | 'cancelled') => Promise<void>;
++  onNavigateToProfile: () => void;
++}) {
++  const [searchTerm, setSearchTerm] = useState('');
++  const [selectedGoal, setSelectedGoal] = useState<string>('all');
++  const [selectedTime, setSelectedTime] = useState<string>('all');
++  const [activeTab, setActiveTab] = useState<'members' | 'requests'>('members');
++  const [partnerModalMember, setPartnerModalMember] = useState<CommunityMember | null>(null);
++  const [proposedDate, setProposedDate] = useState('');
++  const [partnerNote, setPartnerNote] = useState('');
++  const [requestSending, setRequestSending] = useState(false);
++
++  const pendingIncomingCount = useMemo(
++    () => requests.filter((r) => r.isIncoming && r.status === 'pending').length,
++    [requests],
++  );
++
++  const filteredMembers = useMemo(() => {
++    return members.filter((member) => {
++      if (searchTerm) {
++        const query = searchTerm.toLowerCase();
++        const fullName = `${member.firstName} ${member.lastNameInitial}`.toLowerCase();
++        const study = member.courseOfStudy.toLowerCase();
++        if (!fullName.includes(query) && !study.includes(query)) return false;
++      }
++      if (selectedGoal !== 'all') {
++        if (!member.trainingGoals.some((g) => g.toLowerCase().includes(selectedGoal.toLowerCase()))) {
++          return false;
++        }
++      }
++      if (selectedTime !== 'all') {
++        if (!member.preferredTimes.some((t) => t.toLowerCase().includes(selectedTime.toLowerCase()))) {
++          return false;
++        }
++      }
++      return true;
++    });
++  }, [members, searchTerm, selectedGoal, selectedTime]);
++
++  const handleSend = async (e: React.FormEvent) => {
++    e.preventDefault();
++    if (!partnerModalMember) return;
++    setRequestSending(true);
++    try {
++      const dateIso = proposedDate ? new Date(proposedDate).toISOString() : undefined;
++      await onSendRequest(partnerModalMember.id, partnerNote.trim(), dateIso);
++      setPartnerModalMember(null);
++      setPartnerNote('');
++      setProposedDate('');
++    } finally {
++      setRequestSending(false);
++    }
++  };
++
++  return (
++    <>
++      <PageHeading
++        eyebrow="DHBW BAD MERGENTHEIM"
++        title="Gym Community"
++        description="Finde Trainingspartner, verabrede dich zu gemeinsamen Sessions und tausche dich über Ziele aus."
++      />
++
++      {error && <InlineNotice tone="error">{error}</InlineNotice>}
++
++      {/* Community Segment Controls */}
++      <div className="community-subnav" role="tablist" aria-label="Community-Ansichten">
++        <button
++          type="button"
++          role="tab"
++          aria-selected={activeTab === 'members'}
++          className={`community-tab-button ${activeTab === 'members' ? 'is-active' : ''}`}
++          onClick={() => setActiveTab('members')}
++        >
++          <Users size={17} aria-hidden="true" />
++          <span>Mitglieder & Buddies ({members.length})</span>
++        </button>
++        <button
++          type="button"
++          role="tab"
++          aria-selected={activeTab === 'requests'}
++          className={`community-tab-button ${activeTab === 'requests' ? 'is-active' : ''}`}
++          onClick={() => setActiveTab('requests')}
++        >
++          <UserCheck size={17} aria-hidden="true" />
++          <span>Partner-Anfragen</span>
++          {pendingIncomingCount > 0 && (
++            <span className="badge-count" aria-label={`${pendingIncomingCount} offene Anfragen`}>
++              {pendingIncomingCount}
++            </span>
++          )}
++        </button>
++      </div>
++
++      {activeTab === 'requests' && (
++        <section className="surface community-requests-panel">
++          <SectionTitle title="Deine Trainingspartner-Anfragen" />
++          <p className="muted-copy">
++            Hier siehst du eingehende und gesendete Einladungen für gemeinsame Trainings.
++          </p>
++
++          <div className="requests-container">
++            <div>
++              <h3 className="sub-heading">Eingehende Anfragen</h3>
++              {requests.filter((r) => r.isIncoming).length === 0 ? (
++                <p className="muted-copy py-3">Keine eingehenden Partner-Anfragen vorhanden.</p>
++              ) : (
++                <ul className="event-list">
++                  {requests
++                    .filter((r) => r.isIncoming)
++                    .map((req) => (
++                      <li key={req.id} className="event-row partner-request-row">
++                        <div className="event-content">
++                          <div className="flex items-center gap-2">
++                            <strong>{req.senderName}</strong>
++                            <span className={`request-status-pill status-${req.status}`}>
++                              {req.status === 'pending'
++                                ? 'Offen'
++                                : req.status === 'accepted'
++                                ? 'Angenommen'
++                                : 'Abgelehnt'}
++                            </span>
++                          </div>
++                          {req.proposedDate && (
++                            <span className="text-xs text-slate-400">
++                              Vorgeschlagener Termin: {formatDateTime(req.proposedDate)}
++                            </span>
++                          )}
++                          {req.note && <p className="request-note">"{req.note}"</p>}
++                        </div>
++                        {req.status === 'pending' && (
++                          <div className="request-actions">
++                            <button
++                              type="button"
++                              className="button button-primary compact-button"
++                              disabled={busy || !online}
++                              onClick={() => void onRespondRequest(req.id, 'accepted')}
++                              title="Anfrage annehmen"
++                            >
++                              <Check size={15} aria-hidden="true" />
++                              <span>Annehmen</span>
++                            </button>
++                            <button
++                              type="button"
++                              className="button button-secondary compact-button"
++                              disabled={busy || !online}
++                              onClick={() => void onRespondRequest(req.id, 'declined')}
++                              title="Anfrage ablehnen"
++                            >
++                              <X size={15} aria-hidden="true" />
++                              <span>Ablehnen</span>
++                            </button>
++                          </div>
++                        )}
++                      </li>
++                    ))}
++                </ul>
++              )}
++            </div>
++
++            <div className="mt-6">
++              <h3 className="sub-heading">Gesendete Anfragen</h3>
++              {requests.filter((r) => !r.isIncoming).length === 0 ? (
++                <p className="muted-copy py-3">Du hast aktuell keine offenen Anfragen gesendet.</p>
++              ) : (
++                <ul className="event-list">
++                  {requests
++                    .filter((r) => !r.isIncoming)
++                    .map((req) => (
++                      <li key={req.id} className="event-row partner-request-row">
++                        <div className="event-content">
++                          <div className="flex items-center gap-2">
++                            <strong>An {req.receiverName}</strong>
++                            <span className={`request-status-pill status-${req.status}`}>
++                              {req.status === 'pending'
++                                ? 'Wartend auf Antwort'
++                                : req.status === 'accepted'
++                                ? 'Angenommen!'
++                                : 'Abgelehnt'}
++                            </span>
++                          </div>
++                          {req.proposedDate && (
++                            <span className="text-xs text-slate-400">
++                              Termin: {formatDateTime(req.proposedDate)}
++                            </span>
++                          )}
++                          {req.note && <p className="request-note">"{req.note}"</p>}
++                        </div>
++                        {req.status === 'pending' && (
++                          <button
++                            type="button"
++                            className="button button-secondary compact-button"
++                            disabled={busy || !online}
++                            onClick={() => void onRespondRequest(req.id, 'cancelled')}
++                          >
++                            Zurückziehen
++                          </button>
++                        )}
++                      </li>
++                    ))}
++                </ul>
++              )}
++            </div>
++          </div>
++        </section>
++      )}
++
++      {activeTab === 'members' && (
++        <>
++          {/* Search & Filters */}
++          <section className="surface community-filter-bar">
++            <div className="community-search-box">
++              <Search size={17} className="search-icon" aria-hidden="true" />
++              <input
++                type="text"
++                className="community-search-input"
++                placeholder="Nach Name oder Studiengang suchen (z. B. Wirtschaftsinformatik)..."
++                value={searchTerm}
++                onChange={(e) => setSearchTerm(e.target.value)}
++              />
++              {searchTerm && (
++                <button
++                  type="button"
++                  className="icon-button"
++                  onClick={() => setSearchTerm('')}
++                  aria-label="Suche löschen"
++                >
++                  <X size={15} />
++                </button>
++              )}
++            </div>
++
++            <div className="filter-chips-row">
++              <div className="filter-group">
++                <span className="filter-group-label">
++                  <Filter size={14} aria-hidden="true" /> Ziel:
++                </span>
++                {['all', 'Muskelaufbau', 'Kraft', 'Ausdauer', 'Calisthenics'].map((goal) => (
++                  <button
++                    key={goal}
++                    type="button"
++                    className={`filter-chip ${selectedGoal === goal ? 'is-active' : ''}`}
++                    onClick={() => setSelectedGoal(goal)}
++                  >
++                    {goal === 'all' ? 'Alle' : goal}
++                  </button>
++                ))}
++              </div>
++
++              <div className="filter-group">
++                <span className="filter-group-label">
++                  <Clock size={14} aria-hidden="true" /> Zeit:
++                </span>
++                {['all', 'Morgens', 'Nachmittags', 'Abends'].map((time) => (
++                  <button
++                    key={time}
++                    type="button"
++                    className={`filter-chip ${selectedTime === time ? 'is-active' : ''}`}
++                    onClick={() => setSelectedTime(time)}
++                  >
++                    {time === 'all' ? 'Alle' : time}
++                  </button>
++                ))}
++              </div>
++            </div>
++          </section>
++
++          {/* Members Grid */}
++          <section className="community-members-grid">
++            {filteredMembers.length === 0 ? (
++              <EmptyState
++                title="Keine Studierenden gefunden"
++                description="Passe deine Suchbegriffe oder Filter an, um andere Trainingspartner zu finden."
++              />
++            ) : (
++              filteredMembers.map((member) => {
++                const initials = `${member.firstName[0] || ''}${member.lastNameInitial || ''}`;
++                return (
++                  <article key={member.id} className="surface member-card">
++                    <div className="member-card-header">
++                      <div className="member-avatar" aria-hidden="true">
++                        {initials}
++                      </div>
++                      <div className="member-info">
++                        <div className="flex items-center gap-2">
++                          <h3 className="member-name">
++                            {member.firstName} {member.lastNameInitial ? `${member.lastNameInitial}.` : ''}
++                          </h3>
++                          {member.isSelf && <span className="self-tag">Du</span>}
++                        </div>
++                        <p className="member-study">{member.courseOfStudy || 'DHBW Bad Mergentheim'}</p>
++                      </div>
++                    </div>
++
++                    <div className="member-presence-status">
++                      {member.activeNow ? (
++                        <span className="status-live-pill">
++                          <span className="live-dot" aria-hidden="true" />
++                          <span>Jetzt im Gym</span>
++                        </span>
++                      ) : member.plannedNext ? (
++                        <span className="status-planned-pill">
++                          <CalendarClock size={14} aria-hidden="true" />
++                          <span>Nächstes: {formatDateTime(member.plannedNext)}</span>
++                        </span>
++                      ) : (
++                        <span className="status-idle-pill">Keine aktive Planung</span>
++                      )}
++                    </div>
++
++                    {member.trainingGoals.length > 0 && (
++                      <div className="member-tags-container">
++                        <span className="member-tags-label">Ziele:</span>
++                        <div className="member-tags">
++                          {member.trainingGoals.map((g) => (
++                            <span key={g} className="member-tag">
++                              {g}
++                            </span>
++                          ))}
++                        </div>
++                      </div>
++                    )}
++
++                    {member.preferredTimes.length > 0 && (
++                      <div className="member-tags-container">
++                        <span className="member-tags-label">Zeiten:</span>
++                        <div className="member-tags">
++                          {member.preferredTimes.map((t) => (
++                            <span key={t} className="member-tag-time">
++                              {t}
++                            </span>
++                          ))}
++                        </div>
++                      </div>
++                    )}
++
++                    {member.bio && <p className="member-bio">"{member.bio}"</p>}
++
++                    <div className="member-card-footer">
++                      {member.isSelf ? (
++                        <button
++                          type="button"
++                          className="button button-secondary full-width"
++                          onClick={onNavigateToProfile}
++                        >
++                          Dein Profil anpassen
++                        </button>
++                      ) : (
++                        <button
++                          type="button"
++                          className="button button-primary full-width"
++                          disabled={!online || busy}
++                          onClick={() => setPartnerModalMember(member)}
++                        >
++                          <UserPlus size={16} aria-hidden="true" />
++                          <span>Partner-Anfrage</span>
++                        </button>
++                      )}
++                    </div>
++                  </article>
++                );
++              })
++            )}
++          </section>
++        </>
++      )}
++
++      {/* Partner Request Modal */}
++      {partnerModalMember && (
++        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="partner-modal-title">
++          <div className="surface modal-card">
++            <div className="modal-header">
++              <h2 id="partner-modal-title">
++                Trainingspartner-Anfrage an {partnerModalMember.firstName} {partnerModalMember.lastNameInitial}.
++              </h2>
++              <button
++                type="button"
++                className="icon-button"
++                onClick={() => setPartnerModalMember(null)}
++                aria-label="Schließen"
++              >
++                <X size={18} />
++              </button>
++            </div>
++
++            <form onSubmit={handleSend} className="stack-form">
++              <p className="muted-copy text-sm">
++                Verabrede dich zu einer gemeinsamen Session im Gym am Campus Bad Mergentheim. Deine E-Mail oder
++                private Kontaktdaten werden nicht weitergegeben.
++              </p>
++
++              <Field label="Vorgeschlagener Trainingstermin (optional)">
++                <input
++                  type="datetime-local"
++                  className="text-input"
++                  value={proposedDate}
++                  min={new Date().toISOString().slice(0, 16)}
++                  onChange={(e) => setProposedDate(e.target.value)}
++                />
++              </Field>
++
++              <Field label="Nachricht / Fokus">
++                <textarea
++                  className="text-input"
++                  rows={3}
++                  maxLength={200}
++                  placeholder="z. B. Hey, trainieren wir zusammen Brust & Schultern? Bin ab 17:30 da!"
++                  value={partnerNote}
++                  onChange={(e) => setPartnerNote(e.target.value)}
++                />
++              </Field>
++
++              <div className="modal-actions">
++                <button
++                  type="button"
++                  className="button button-secondary"
++                  onClick={() => setPartnerModalMember(null)}
++                >
++                  Abbrechen
++                </button>
++                <button
++                  type="submit"
++                  className="button button-primary"
++                  disabled={requestSending || !online}
++                >
++                  <Send size={16} aria-hidden="true" />
++                  <span>{requestSending ? 'Wird gesendet...' : 'Anfrage senden'}</span>
++                </button>
++              </div>
++            </form>
++          </div>
++        </div>
++      )}
++    </>
++  );
++}
+diff --git a/src/features/gym/GymApp.tsx b/src/features/gym/GymApp.tsx
+index 300a72f..3f4c011 100644
+--- a/src/features/gym/GymApp.tsx
++++ b/src/features/gym/GymApp.tsx
+@@ -1,8 +1,25 @@
+-﻿import { useCallback, useEffect, useState } from 'react';
+-import { GymApiError, gymRepository, type GymAvailability, type GymBooking, type GymSession, type OccupancySnapshot, type OccupancyRange, type SharedBookingSlot, type WorkoutLog, type GymVisit } from '../../services/gymRepository';
++import { useCallback, useEffect, useState } from 'react';
++import {
++  GymApiError,
++  gymRepository,
++  type ActiveCheckInItem,
++  type CalendarEventItem,
++  type CommunityMember,
++  type CommunityProfile,
++  type GymAvailability,
++  type GymBooking,
++  type GymSession,
++  type GymVisit,
++  type OccupancyRange,
++  type OccupancySnapshot,
++  type SharedBookingSlot,
++  type TrainingPartnerRequest,
++  type WorkoutLog,
++} from '../../services/gymRepository';
+ import { AppFrame, InlineNotice, type GymPage } from './components';
+ import { Dashboard } from './Dashboard';
+ import { Calendar } from './Calendar';
++import { Community } from './Community';
+ import { Training } from './Training';
+ import { Progress } from './Progress';
+ import { Profile } from './Profile';
+@@ -15,6 +32,7 @@ export function GymApp() {
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+   const [toast, setToast] = useState<string | null>(null);
++
+   const [session, setSession] = useState<GymSession | null>(null);
+   const [occupancy, setOccupancy] = useState<OccupancySnapshot | null>(null);
+   const [occupancyRange, setOccupancyRange] = useState<OccupancyRange>('24h');
+@@ -25,21 +43,49 @@ export function GymApp() {
+   const [weeklyGoal, setWeeklyGoal] = useState(3);
+   const [availability, setAvailability] = useState<GymAvailability | null>(null);
+ 
++  // Community & Live Calendar states
++  const [calendarEvents, setCalendarEvents] = useState<CalendarEventItem[]>([]);
++  const [activeCheckIns, setActiveCheckIns] = useState<ActiveCheckInItem[]>([]);
++  const [communityProfile, setCommunityProfile] = useState<CommunityProfile | null>(null);
++  const [communityMembers, setCommunityMembers] = useState<CommunityMember[]>([]);
++  const [partnerRequests, setPartnerRequests] = useState<TrainingPartnerRequest[]>([]);
++
+   const refreshAll = useCallback(async () => {
+     try {
+       const currentSession = await gymRepository.getSession();
+-      const [currentOccupancy, shared, mine, currentVisits, currentWorkouts, currentGoal] = await Promise.all([
++      const [
++        currentOccupancy,
++        shared,
++        mine,
++        calData,
++        cProfile,
++        cMembers,
++        pRequests,
++        currentVisits,
++        currentWorkouts,
++        currentGoal,
++      ] = await Promise.all([
+         gymRepository.getOccupancy(occupancyRange),
+         gymRepository.getBookings(),
+         gymRepository.getMyBookings(),
++        gymRepository.getCalendarEvents(),
++        gymRepository.getCommunityProfile().catch(() => null),
++        gymRepository.getCommunityMembers().catch(() => []),
++        gymRepository.getPartnerRequests().catch(() => []),
+         gymRepository.getVisits(),
+         gymRepository.getWorkouts(),
+         gymRepository.getWeeklyGoal(),
+       ]);
++
+       setSession(currentSession);
+       setOccupancy(currentOccupancy);
+       setSharedSlots(shared.slots);
+       setBookings(mine);
++      setCalendarEvents(calData.events);
++      setActiveCheckIns(calData.activeCheckIns);
++      setCommunityProfile(cProfile);
++      setCommunityMembers(cMembers);
++      setPartnerRequests(pRequests);
+       setVisits(currentVisits);
+       setWorkouts(currentWorkouts);
+       setWeeklyGoal(currentGoal);
+@@ -53,16 +99,17 @@ export function GymApp() {
+     }
+   }, [occupancyRange]);
+ 
+-  const refreshOccupancy = useCallback(async () => {
++  const refreshLivePresence = useCallback(async () => {
+     try {
+-      const [current, currentSession, shared] = await Promise.all([
++      const [current, currentSession, calData] = await Promise.all([
+         gymRepository.getOccupancy(occupancyRange),
+         gymRepository.getSession(),
+-        gymRepository.getBookings(),
++        gymRepository.getCalendarEvents(),
+       ]);
+       setOccupancy(current);
+       setSession(currentSession);
+-      setSharedSlots(shared.slots);
++      setCalendarEvents(calData.events);
++      setActiveCheckIns(calData.activeCheckIns);
+       setOnline(true);
+     } catch (caught) {
+       setOnline(false);
+@@ -70,10 +117,13 @@ export function GymApp() {
+     }
+   }, [occupancyRange]);
+ 
++  // Smart polling: every 15s + on window focus / tab visibility change
+   useEffect(() => {
+     void refreshAll();
+-    const timer = window.setInterval(() => void refreshOccupancy(), 15_000);
+-    const onFocus = () => { if (document.visibilityState === 'visible') void refreshAll(); };
++    const timer = window.setInterval(() => void refreshLivePresence(), 15_000);
++    const onFocus = () => {
++      if (document.visibilityState === 'visible') void refreshAll();
++    };
+     window.addEventListener('focus', onFocus);
+     document.addEventListener('visibilitychange', onFocus);
+     return () => {
+@@ -81,7 +131,7 @@ export function GymApp() {
+       window.removeEventListener('focus', onFocus);
+       document.removeEventListener('visibilitychange', onFocus);
+     };
+-  }, [refreshAll, refreshOccupancy]);
++  }, [refreshAll, refreshLivePresence]);
+ 
+   useEffect(() => {
+     if (!toast) return;
+@@ -89,49 +139,80 @@ export function GymApp() {
+     return () => window.clearTimeout(timer);
+   }, [toast]);
+ 
+-  const runMutation = useCallback(async (operation: () => Promise<void>, successMessage: string) => {
+-    setBusy(true);
+-    setError(null);
+-    try {
+-      await operation();
+-      await refreshAll();
+-      setToast(successMessage);
+-    } catch (caught) {
+-      setError(errorMessage(caught));
+-    } finally {
+-      setBusy(false);
+-    }
+-  }, [refreshAll]);
++  const runMutation = useCallback(
++    async (operation: () => Promise<void>, successMessage: string) => {
++      setBusy(true);
++      setError(null);
++      try {
++        await operation();
++        await refreshAll();
++        setToast(successMessage);
++      } catch (caught) {
++        setError(errorMessage(caught));
++      } finally {
++        setBusy(false);
++      }
++    },
++    [refreshAll],
++  );
+ 
+-  const handlePresence = useCallback((present: boolean) => runMutation(
+-    () => gymRepository.setCheckedIn(present),
+-    present ? 'Du bist eingecheckt.' : 'Du wurdest ausgecheckt.',
+-  ), [runMutation]);
++  const handlePresence = useCallback(
++    (present: boolean) =>
++      runMutation(
++        () => gymRepository.setCheckedIn(present),
++        present ? 'Du bist im Gym eingecheckt.' : 'Du wurdest erfolgreich ausgecheckt.',
++      ),
++    [runMutation],
++  );
+ 
+-  const handleCreateBooking = useCallback((input: { startsAt: string; durationMinutes: number; title?: string }) => runMutation(
+-    async () => { await gymRepository.createBooking(input); },
+-    'Deine Trainingszeit wurde reserviert.',
+-  ), [runMutation]);
++  const handleCreateBooking = useCallback(
++    (input: { startsAt: string; durationMinutes: number; title?: string; entryType?: 'planned' | 'reservation' }) =>
++      runMutation(
++        async () => {
++          await gymRepository.createBooking(input);
++        },
++        input.entryType === 'reservation' ? 'Deine Trainingszeit wurde reserviert.' : 'Geplante Anwesenheit eingetragen.',
++      ),
++    [runMutation],
++  );
+ 
+-  const handleDeleteBooking = useCallback((id: string) => runMutation(
+-    () => gymRepository.deleteBooking(id),
+-    'Reservierung storniert.',
+-  ), [runMutation]);
++  const handleDeleteBooking = useCallback(
++    (id: string) =>
++      runMutation(
++        () => gymRepository.deleteBooking(id),
++        'Eintrag entfernt.',
++      ),
++    [runMutation],
++  );
+ 
+-  const handleCreateWorkout = useCallback((input: Omit<WorkoutLog, 'id'>) => runMutation(
+-    () => gymRepository.createWorkout(input),
+-    'Training gespeichert.',
+-  ), [runMutation]);
++  const handleCreateWorkout = useCallback(
++    (input: Omit<WorkoutLog, 'id'>) =>
++      runMutation(
++        () => gymRepository.createWorkout(input),
++        'Training gespeichert.',
++      ),
++    [runMutation],
++  );
+ 
+-  const handleDeleteWorkout = useCallback((id: string) => runMutation(
+-    () => gymRepository.deleteWorkout(id),
+-    'Training gelÃ¶scht.',
+-  ), [runMutation]);
++  const handleDeleteWorkout = useCallback(
++    (id: string) =>
++      runMutation(
++        () => gymRepository.deleteWorkout(id),
++        'Training gelöscht.',
++      ),
++    [runMutation],
++  );
+ 
+-  const handleGoal = useCallback((value: number) => runMutation(
+-    async () => { await gymRepository.setWeeklyGoal(value); },
+-    'Wochenziel aktualisiert.',
+-  ), [runMutation]);
++  const handleGoal = useCallback(
++    (value: number) =>
++      runMutation(
++        async () => {
++          await gymRepository.setWeeklyGoal(value);
++        },
++        'Wochenziel aktualisiert.',
++      ),
++    [runMutation],
++  );
+ 
+   const handleAvailability = useCallback(async (startAt: string, duration: number) => {
+     try {
+@@ -141,6 +222,113 @@ export function GymApp() {
+     }
+   }, []);
+ 
++  const handleSaveProfile = useCallback(
++    async (updated: Partial<CommunityProfile>) => {
++      setBusy(true);
++      setError(null);
++      try {
++        const saved = await gymRepository.updateCommunityProfile(updated);
++        setCommunityProfile(saved);
++        await refreshAll();
++        setToast('Community-Profil gespeichert.');
++      } catch (caught) {
++        setError(errorMessage(caught));
++      } finally {
++        setBusy(false);
++      }
++    },
++    [refreshAll],
++  );
++
++  const handleSendPartnerRequest = useCallback(
++    async (receiverId: string, note?: string, proposedDate?: string) => {
++      setBusy(true);
++      setError(null);
++      try {
++        await gymRepository.sendPartnerRequest(receiverId, note, proposedDate);
++        await refreshAll();
++        setToast('Trainingspartner-Anfrage gesendet.');
++      } catch (caught) {
++        setError(errorMessage(caught));
++      } finally {
++        setBusy(false);
++      }
++    },
++    [refreshAll],
++  );
++
++  const handleRespondPartnerRequest = useCallback(
++    async (id: string, status: 'accepted' | 'declined' | 'cancelled') => {
++      setBusy(true);
++      setError(null);
++      try {
++        await gymRepository.respondToPartnerRequest(id, status);
++        await refreshAll();
++        setToast(
++          status === 'accepted'
++            ? 'Partner-Anfrage angenommen!'
++            : status === 'declined'
++            ? 'Anfrage abgelehnt.'
++            : 'Anfrage zurückgezogen.',
++        );
++      } catch (caught) {
++        setError(errorMessage(caught));
++      } finally {
++        setBusy(false);
++      }
++    },
++    [refreshAll],
++  );
++
++  const handleRegister = useCallback(
++    async (data: { email: string; password: string; firstName?: string; lastNameInitial?: string; courseOfStudy?: string }) => {
++      setBusy(true);
++      setError(null);
++      try {
++        await gymRepository.registerWithDhbw(data);
++        await refreshAll();
++        setToast('DHBW-Konto erfolgreich registriert!');
++      } catch (caught) {
++        setError(errorMessage(caught));
++        throw caught;
++      } finally {
++        setBusy(false);
++      }
++    },
++    [refreshAll],
++  );
++
++  const handleLogin = useCallback(
++    async (email: string, pass: string) => {
++      setBusy(true);
++      setError(null);
++      try {
++        await gymRepository.login(email, pass);
++        await refreshAll();
++        setToast('Erfolgreich angemeldet!');
++      } catch (caught) {
++        setError(errorMessage(caught));
++        throw caught;
++      } finally {
++        setBusy(false);
++      }
++    },
++    [refreshAll],
++  );
++
++  const handleLogout = useCallback(async () => {
++    setBusy(true);
++    try {
++      await gymRepository.logout();
++      await refreshAll();
++      setToast('Abgemeldet.');
++    } catch (caught) {
++      setError(errorMessage(caught));
++    } finally {
++      setBusy(false);
++    }
++  }, [refreshAll]);
++
+   const handleIssueRecoveryCode = useCallback(async () => {
+     setError(null);
+     try {
+@@ -154,33 +342,143 @@ export function GymApp() {
+     }
+   }, [refreshAll]);
+ 
+-  const handleRecover = useCallback((code: string) => runMutation(
+-    () => gymRepository.recoverProfile(code),
+-    'Profil wiederhergestellt. Deine Serverdaten sind wieder verfÃ¼gbar.',
+-  ), [runMutation]);
++  const handleRecover = useCallback(
++    (code: string) =>
++      runMutation(
++        () => gymRepository.recoverProfile(code),
++        'Profil wiederhergestellt. Deine Serverdaten sind wieder verfügbar.',
++      ),
++    [runMutation],
++  );
+ 
+   const handleDeleteData = useCallback(() => {
+-    if (!window.confirm('Alle deine Trainingsdaten, Reservierungen, Ziele und die Besuchshistorie wirklich lÃ¶schen?')) return;
++    if (
++      !window.confirm(
++        'Alle deine Trainingsdaten, Profilangaben, Reservierungen und Partner-Anfragen wirklich löschen?',
++      )
++    ) {
++      return;
++    }
+     void runMutation(async () => {
+       await gymRepository.deletePersonalData();
+       setPage('dashboard');
+-    }, 'Deine persÃ¶nlichen App-Daten wurden gelÃ¶scht.');
++    }, 'Deine persönlichen App-Daten wurden vollständig gelöscht.');
+   }, [runMutation]);
+ 
+   if (loading) {
+-    return <div className="app-loading" role="status"><span className="loading-mark" /><p>Gym Hub wird verbunden â€¦</p></div>;
++    return (
++      <div className="app-loading" role="status">
++        <span className="loading-mark" />
++        <p>DHBW Gym Hub wird verbunden …</p>
++      </div>
++    );
+   }
+ 
+   return (
+     <AppFrame page={page} onNavigate={setPage}>
+-      {!online && <InlineNotice tone="warning">Der Gym-Server ist nicht erreichbar. Angezeigte Daten kÃ¶nnen veraltet sein; Check-in, Reservierungen und Speichern sind derzeit deaktiviert.</InlineNotice>}
+-      {page === 'dashboard' && <Dashboard session={session} occupancy={occupancy} occupancyRange={occupancyRange} onOccupancyRangeChange={setOccupancyRange} bookings={bookings} workouts={workouts} online={online} busy={busy} error={error} onPresence={handlePresence} onNavigate={setPage} />}
+-      {page === 'calendar' && <Calendar bookings={bookings} sharedSlots={sharedSlots} visits={visits} availability={availability} online={online} busy={busy} error={error} onCreateBooking={handleCreateBooking} onDeleteBooking={handleDeleteBooking} onCheckAvailability={handleAvailability} />}
+-      {page === 'training' && <Training workouts={workouts} busy={busy} error={error} online={online} onCreate={handleCreateWorkout} onDelete={handleDeleteWorkout} />}
+-      {page === 'progress' && <Progress workouts={workouts} weeklyGoal={weeklyGoal} busy={busy} error={error} online={online} onUpdateGoal={handleGoal} />}
+-      {page === 'profile' && <Profile session={session} online={online} busy={busy} error={error} onCreateRecoveryCode={handleIssueRecoveryCode} onRecover={handleRecover} onDeleteData={handleDeleteData} />}
+-      <footer className="gym-footer"><span>Manuelle App-Check-ins Â· keine DHBW-Scannerverbindung</span><span>Belegung aktualisiert automatisch alle 15 Sekunden</span></footer>
+-      <div className="toast-region" aria-live="polite" aria-atomic="true">{toast && <div className="toast-message">{toast}</div>}</div>
++      {!online && (
++        <InlineNotice tone="warning">
++          Der Gym-Server ist nicht erreichbar. Angezeigte Daten können veraltet sein; Check-in,
++          Reservierungen und Speichern sind derzeit deaktiviert.
++        </InlineNotice>
++      )}
++
++      {page === 'dashboard' && (
++        <Dashboard
++          session={session}
++          occupancy={occupancy}
++          occupancyRange={occupancyRange}
++          onOccupancyRangeChange={setOccupancyRange}
++          bookings={bookings}
++          workouts={workouts}
++          online={online}
++          busy={busy}
++          error={error}
++          onPresence={handlePresence}
++          onNavigate={setPage}
++        />
++      )}
++
++      {page === 'calendar' && (
++        <Calendar
++          session={session}
++          calendarEvents={calendarEvents}
++          activeCheckIns={activeCheckIns}
++          visits={visits}
++          workouts={workouts}
++          availability={availability}
++          online={online}
++          busy={busy}
++          error={error}
++          onCreateBooking={handleCreateBooking}
++          onDeleteBooking={handleDeleteBooking}
++          onCheckAvailability={handleAvailability}
++          onPresence={handlePresence}
++          onNavigate={setPage}
++        />
++      )}
++
++      {page === 'community' && (
++        <Community
++          members={communityMembers}
++          requests={partnerRequests}
++          myProfile={communityProfile}
++          online={online}
++          busy={busy}
++          error={error}
++          onSendRequest={handleSendPartnerRequest}
++          onRespondRequest={handleRespondPartnerRequest}
++          onNavigateToProfile={() => setPage('profile')}
++        />
++      )}
++
++      {page === 'training' && (
++        <Training
++          workouts={workouts}
++          busy={busy}
++          error={error}
++          online={online}
++          onCreate={handleCreateWorkout}
++          onDelete={handleDeleteWorkout}
++        />
++      )}
++
++      {page === 'progress' && (
++        <Progress
++          workouts={workouts}
++          weeklyGoal={weeklyGoal}
++          busy={busy}
++          error={error}
++          online={online}
++          onUpdateGoal={handleGoal}
++        />
++      )}
++
++      {page === 'profile' && (
++        <Profile
++          session={session}
++          profile={communityProfile}
++          online={online}
++          busy={busy}
++          error={error}
++          onCreateRecoveryCode={handleIssueRecoveryCode}
++          onRecover={handleRecover}
++          onDeleteData={handleDeleteData}
++          onSaveProfile={handleSaveProfile}
++          onRegister={handleRegister}
++          onLogin={handleLogin}
++          onLogout={handleLogout}
++        />
++      )}
++
++      <footer className="gym-footer">
++        <span>DHBW Bad Mergentheim · Campus-Gym Community</span>
++        <span>Smart-Polling alle 15 Sekunden aktiv</span>
++      </footer>
++
++      <div className="toast-region" aria-live="polite" aria-atomic="true">
++        {toast && <div className="toast-message">{toast}</div>}
++      </div>
+     </AppFrame>
+   );
+ }
+@@ -188,11 +486,13 @@ export function GymApp() {
+ function errorMessage(error: unknown): string {
+   if (error instanceof GymApiError) {
+     if (error.status === 0) return error.message;
+-    if (error.status === 409) return 'Diese Zeit hast du bereits geplant.';
+-    if (error.status === 401) return 'Deine Sitzung ist abgelaufen. Bitte lade die App neu oder stelle dein Profil wieder her.';
+-    if (error.status === 429) return 'Zu viele Wiederherstellungsversuche. Bitte warte kurz und versuche es erneut.';
+-    if (error.status === 400) return 'Bitte prÃ¼fe die eingegebenen Daten.';
++    if (error.status === 409) return 'Diese Zeit hast du bereits geplant oder eine Anfrage existiert bereits.';
++    if (error.status === 401)
++      return 'Deine Sitzung ist abgelaufen oder Zugangsdaten sind ungültig.';
++    if (error.status === 429) return 'Zu viele Versuche. Bitte warte kurz und versuche es erneut.';
++    if (error.status === 400) return error.message || 'Bitte prüfe die eingegebenen Daten.';
+   }
+-  return 'Das hat gerade nicht funktioniert. Bitte versuche es noch einmal.';
++  return error instanceof Error
++    ? error.message
++    : 'Das hat gerade nicht funktioniert. Bitte versuche es noch einmal.';
+ }
+-
+diff --git a/src/features/gym/Profile.tsx b/src/features/gym/Profile.tsx
+index d682b6b..f093a15 100644
+--- a/src/features/gym/Profile.tsx
++++ b/src/features/gym/Profile.tsx
+@@ -1,27 +1,152 @@
+ import { useState } from 'react';
+-import { Check, Copy, KeyRound, ShieldCheck, Trash2 } from 'lucide-react';
+-import type { GymSession } from '../../services/gymRepository';
++import {
++  Check,
++  Copy,
++  Eye,
++  EyeOff,
++  GraduationCap,
++  KeyRound,
++  Lock,
++  LogOut,
++  Mail,
++  Save,
++  ShieldCheck,
++  Target,
++  Trash2,
++  User,
++  UserCheck,
++} from 'lucide-react';
++import type { CommunityProfile, GymSession } from '../../services/gymRepository';
+ import { Field, InlineNotice, PageHeading, SectionTitle } from './components';
+ 
+-export function Profile({ session, online, busy, error, onCreateRecoveryCode, onRecover, onDeleteData }: {
++const AVAILABLE_GOALS = [
++  'Hypertrophie (Muskelaufbau)',
++  'Kraftsport (Powerlifting)',
++  'Ausdauer & Cardio',
++  'Calisthenics & Bodyweight',
++  'Rückengesundheit & Mobilität',
++];
++
++const AVAILABLE_TIMES = [
++  'Morgens (06:00 – 10:00)',
++  'Mittags (11:30 – 14:00)',
++  'Nachmittags (15:00 – 18:00)',
++  'Abends (18:00 – 22:00)',
++];
++
++export function Profile({
++  session,
++  profile,
++  online,
++  busy,
++  error,
++  onCreateRecoveryCode,
++  onRecover,
++  onDeleteData,
++  onSaveProfile,
++  onRegister,
++  onLogin,
++  onLogout,
++}: {
+   session: GymSession | null;
++  profile: CommunityProfile | null;
+   online: boolean;
+   busy: boolean;
+   error: string | null;
+   onCreateRecoveryCode: () => Promise<string>;
+   onRecover: (code: string) => void;
+   onDeleteData: () => void;
++  onSaveProfile: (updated: Partial<CommunityProfile>) => Promise<void>;
++  onRegister: (data: { email: string; password: string; firstName?: string; lastNameInitial?: string; courseOfStudy?: string }) => Promise<void>;
++  onLogin: (email: string, password: string) => Promise<void>;
++  onLogout: () => Promise<void>;
+ }) {
++  // Community profile states
++  const [firstName, setFirstName] = useState(profile?.firstName ?? '');
++  const [lastNameInitial, setLastNameInitial] = useState(profile?.lastNameInitial ?? '');
++  const [courseOfStudy, setCourseOfStudy] = useState(profile?.courseOfStudy ?? '');
++  const [selectedGoals, setSelectedGoals] = useState<string[]>(profile?.trainingGoals ?? []);
++  const [selectedTimes, setSelectedTimes] = useState<string[]>(profile?.preferredTimes ?? []);
++  const [bio, setBio] = useState(profile?.bio ?? '');
++  const [isPublicPresence, setIsPublicPresence] = useState(profile?.isPublicPresence ?? true);
++  const [profileSaving, setProfileSaving] = useState(false);
++  const [profileSuccess, setProfileSuccess] = useState<string | null>(null);
++
++  // Auth states
++  const [authMode, setAuthMode] = useState<'view' | 'login' | 'register'>('view');
++  const [authEmail, setAuthEmail] = useState('');
++  const [authPassword, setAuthPassword] = useState('');
++  const [authFirstName, setAuthFirstName] = useState('');
++  const [authLastName, setAuthLastName] = useState('');
++  const [authStudy, setAuthStudy] = useState('');
++  const [authBusy, setAuthBusy] = useState(false);
++
++  // Recovery states
+   const [recoveryCode, setRecoveryCode] = useState('');
+   const [restoreInput, setRestoreInput] = useState('');
+   const [copied, setCopied] = useState(false);
+ 
++  const toggleGoal = (goal: string) => {
++    setSelectedGoals((prev) =>
++      prev.includes(goal) ? prev.filter((g) => g !== goal) : [...prev, goal],
++    );
++  };
++
++  const toggleTime = (time: string) => {
++    setSelectedTimes((prev) =>
++      prev.includes(time) ? prev.filter((t) => t !== time) : [...prev, time],
++    );
++  };
++
++  const handleProfileSubmit = async (e: React.FormEvent) => {
++    e.preventDefault();
++    setProfileSaving(true);
++    setProfileSuccess(null);
++    try {
++      await onSaveProfile({
++        firstName: firstName.trim(),
++        lastNameInitial: lastNameInitial.trim().slice(0, 1).toUpperCase(),
++        courseOfStudy: courseOfStudy.trim(),
++        trainingGoals: selectedGoals,
++        preferredTimes: selectedTimes,
++        bio: bio.trim(),
++        isPublicPresence,
++      });
++      setProfileSuccess('Dein Community-Profil wurde erfolgreich gespeichert.');
++    } finally {
++      setProfileSaving(false);
++    }
++  };
++
++  const handleAuthSubmit = async (e: React.FormEvent) => {
++    e.preventDefault();
++    setAuthBusy(true);
++    try {
++      if (authMode === 'register') {
++        await onRegister({
++          email: authEmail.trim(),
++          password: authPassword,
++          firstName: authFirstName.trim(),
++          lastNameInitial: authLastName.trim().slice(0, 1),
++          courseOfStudy: authStudy.trim(),
++        });
++      } else {
++        await onLogin(authEmail.trim(), authPassword);
++      }
++      setAuthMode('view');
++      setAuthEmail('');
++      setAuthPassword('');
++    } finally {
++      setAuthBusy(false);
++    }
++  };
++
+   const createCode = async () => {
+     try {
+       setRecoveryCode(await onCreateRecoveryCode());
+       setCopied(false);
+     } catch {
+-      // The parent displays the API error.
++      // handled
+     }
+   };
+ 
+@@ -41,32 +166,392 @@ export function Profile({ session, online, busy, error, onCreateRecoveryCode, on
+ 
+   return (
+     <>
+-      <PageHeading eyebrow="KONTO & DATENSCHUTZ" title="Profil" description="Deine Trainingsdaten und Einstellungen werden serverseitig deinem anonymen Profil zugeordnet." />
++      <PageHeading
++        eyebrow="DEIN KONTO & DATENSCHUTZ"
++        title="Profil & Einstellungen"
++        description="Passe deine Trainingsinteressen, deine Sichtbarkeit im gemeinsamen Kalender und deine DHBW-Kennung an."
++      />
++
+       {error && <InlineNotice tone="error">{error}</InlineNotice>}
++      {profileSuccess && <InlineNotice tone="success">{profileSuccess}</InlineNotice>}
++
+       <div className="profile-grid">
++        {/* 1. Community Profile Form */}
+         <section className="surface profile-card">
+-          <span className="icon-badge"><ShieldCheck size={19} aria-hidden="true" /></span>
+-          <SectionTitle title="Dein App-Profil" />
+-          <dl className="profile-details"><div><dt>Profil</dt><dd>Anonym · nicht mit DHBW-Konto verbunden</dd></div><div><dt>Speicherung</dt><dd>Backend-Profil auf diesem Server</dd></div><div><dt>Check-in</dt><dd>Manuell gemeldet · automatisches Ende nach {session?.maxCheckInHours ?? 8} Stunden</dd></div><div><dt>Besuchshistorie</dt><dd>90 Tage</dd></div></dl>
+-          <p className="field-hint">Dein Profil wird über ein zufälliges, geschütztes Sitzungstoken erkannt. Die Profil-ID wird nicht im Browser eingegeben oder über URLs geändert.</p>
++          <div className="panel-topline">
++            <span className="icon-badge">
++              <UserCheck size={19} aria-hidden="true" />
++            </span>
++            <span className="panel-label">Community-Profil</span>
++          </div>
++
++          <SectionTitle title="Trainingsprofil & Interessen" />
++          <p className="muted-copy">
++            Diese Angaben helfen anderen DHBW-Studierenden, passende Trainingspartner für gemeinsame Zeiten
++            zu finden.
++          </p>
++
++          <form onSubmit={handleProfileSubmit} className="stack-form mt-4">
++            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
++              <Field label="Vorname">
++                <input
++                  type="text"
++                  className="text-input"
++                  required
++                  maxLength={40}
++                  value={firstName}
++                  placeholder="z. B. Max"
++                  onChange={(e) => setFirstName(e.target.value)}
++                />
++              </Field>
++              <Field label="Nachname (wird nur als Initiale gezeigt)">
++                <input
++                  type="text"
++                  className="text-input"
++                  maxLength={1}
++                  value={lastNameInitial}
++                  placeholder="z. B. M"
++                  onChange={(e) => setLastNameInitial(e.target.value)}
++                />
++              </Field>
++            </div>
++
++            <Field label="Studiengang / Fakultät">
++              <input
++                type="text"
++                className="text-input"
++                maxLength={80}
++                value={courseOfStudy}
++                placeholder="z. B. Wirtschaftsinformatik, BWL-Handel, Maschinenbau"
++                onChange={(e) => setCourseOfStudy(e.target.value)}
++              />
++            </Field>
++
++            <Field label="Deine Trainingsziele">
++              <div className="checkbox-chips-grid">
++                {AVAILABLE_GOALS.map((goal) => {
++                  const active = selectedGoals.includes(goal);
++                  return (
++                    <button
++                      key={goal}
++                      type="button"
++                      className={`goal-chip-button ${active ? 'is-active' : ''}`}
++                      onClick={() => toggleGoal(goal)}
++                    >
++                      <Target size={14} aria-hidden="true" />
++                      <span>{goal}</span>
++                    </button>
++                  );
++                })}
++              </div>
++            </Field>
++
++            <Field label="Bevorzugte Trainingszeiten">
++              <div className="checkbox-chips-grid">
++                {AVAILABLE_TIMES.map((time) => {
++                  const active = selectedTimes.includes(time);
++                  return (
++                    <button
++                      key={time}
++                      type="button"
++                      className={`goal-chip-button ${active ? 'is-active' : ''}`}
++                      onClick={() => toggleTime(time)}
++                    >
++                      <span>{time}</span>
++                    </button>
++                  );
++                })}
++              </div>
++            </Field>
++
++            <Field label="Über mich / Gym-Buddy-Gesuch">
++              <textarea
++                className="text-input"
++                rows={2}
++                maxLength={250}
++                placeholder="z. B. Trainiere 3-4x pro Woche, suche jemanden zum Spotten beim Bankdrücken."
++                value={bio}
++                onChange={(e) => setBio(e.target.value)}
++              />
++            </Field>
++
++            {/* Privacy Toggle Card */}
++            <div className={`privacy-toggle-box ${isPublicPresence ? 'active' : 'private'}`}>
++              <div className="toggle-info">
++                <div className="flex items-center gap-2">
++                  {isPublicPresence ? (
++                    <Eye size={18} className="text-emerald-400" />
++                  ) : (
++                    <EyeOff size={18} className="text-amber-400" />
++                  )}
++                  <strong className="text-sm">
++                    {isPublicPresence ? 'Öffentliche Anwesenheit aktiv' : 'Privater Modus aktiv'}
++                  </strong>
++                </div>
++                <p className="text-xs text-slate-300 mt-1">
++                  {isPublicPresence
++                    ? 'Dein Vorname & Initiale (z. B. Anna S.) sind im Kalender und in der Community sichtbar.'
++                    : 'Deine Einträge werden im Kalender als „Anonymer DHBW Student“ geführt. Deine Identität ist verborgen.'}
++                </p>
++              </div>
++              <button
++                type="button"
++                className={`button compact-button ${isPublicPresence ? 'button-secondary' : 'button-primary'}`}
++                onClick={() => setIsPublicPresence(!isPublicPresence)}
++              >
++                {isPublicPresence ? 'Auf Privat schalten' : 'Sichtbar machen'}
++              </button>
++            </div>
++
++            <button
++              type="submit"
++              className="button button-primary full-width mt-3"
++              disabled={profileSaving || busy || !online}
++            >
++              <Save size={16} aria-hidden="true" />
++              <span>{profileSaving ? 'Wird gespeichert...' : 'Profil speichern'}</span>
++            </button>
++          </form>
+         </section>
+ 
++        {/* 2. DHBW Account & Authentication */}
+         <section className="surface profile-card">
+-          <span className="icon-badge"><KeyRound size={19} aria-hidden="true" /></span>
+-          <SectionTitle title="Profil wiederherstellen" />
+-          <p className="muted-copy">Erstelle einen einmaligen Wiederherstellungscode, bevor du Gerät oder Browser wechselst. Der Server speichert nur einen Hash des Codes.</p>
+-          {!session?.recoveryConfigured && <button type="button" className="button button-secondary" disabled={!online || busy} onClick={() => void createCode()}>Wiederherstellungscode erstellen</button>}
+-          {session?.recoveryConfigured && !recoveryCode && <InlineNotice tone="success">Ein Code ist eingerichtet. Bewahre deinen angezeigten Code sicher auf. Du kannst einen neuen erzeugen, wenn du den aktuellen verloren hast.</InlineNotice>}
+-          {recoveryCode && <div className="recovery-code-panel"><p>Dieser Code wird nur jetzt angezeigt. Speichere ihn an einem sicheren Ort. Er ersetzt den zuvor gültigen Code.</p><code>{recoveryCode}</code><button type="button" className="button button-secondary" onClick={() => void copyCode()}>{copied ? <Check size={16} aria-hidden="true" /> : <Copy size={16} aria-hidden="true" />}{copied ? 'Kopiert' : 'Code kopieren'}</button></div>}
+-          <form className="stack-form recovery-form" onSubmit={submitRecovery}><Field label="Vorhandenen Code eingeben"><input className="text-input" value={restoreInput} onChange={(event) => setRestoreInput(event.target.value)} autoComplete="off" spellCheck={false} placeholder="Wiederherstellungscode" required /></Field><button type="submit" className="button button-primary" disabled={!online || busy || restoreInput.trim().length < 20}>Profil wiederherstellen</button></form>
+-          <p className="field-hint">Ein Wiederherstellungscode funktioniert nur einmal. Bei erfolgreicher Wiederherstellung wird die bisherige Sitzung widerrufen.</p>
++          <div className="panel-topline">
++            <span className="icon-badge">
++              <GraduationCap size={19} aria-hidden="true" />
++            </span>
++            <span className="panel-label">DHBW Zugang</span>
++          </div>
++
++          <SectionTitle title="DHBW Hochschul-Konto" />
++
++          {session?.identity === 'local-account' && (session as any).email ? (
++            <div className="account-status-box">
++              <div className="flex items-center gap-2 text-emerald-400 mb-2">
++                <ShieldCheck size={18} />
++                <span className="font-semibold text-sm">Verifizierte DHBW-E-Mail</span>
++              </div>
++              <p className="text-sm font-mono bg-slate-900 p-2.5 rounded-lg border border-slate-700">
++                {(session as any).email}
++              </p>
++              <p className="muted-copy text-xs mt-2">
++                Dein Profil ist sicher mit deiner Hochschul-E-Mail verknüpft.
++              </p>
++              <button
++                type="button"
++                className="button button-secondary full-width mt-4"
++                disabled={busy || !online}
++                onClick={onLogout}
++              >
++                <LogOut size={16} aria-hidden="true" />
++                <span>Abmelden</span>
++              </button>
++            </div>
++          ) : authMode === 'view' ? (
++            <div className="account-anon-box">
++              <p className="text-sm text-slate-300">
++                Du nutzt die App aktuell mit einer temporären, anonymen Gerätesitzung. Registriere deine
++                offizielle DHBW-E-Mail, um dein Profil geräteübergreifend zu sichern.
++              </p>
++              <div className="flex gap-2 mt-4">
++                <button
++                  type="button"
++                  className="button button-primary flex-1"
++                  onClick={() => setAuthMode('register')}
++                >
++                  <Mail size={16} />
++                  <span>Registrieren</span>
++                </button>
++                <button
++                  type="button"
++                  className="button button-secondary flex-1"
++                  onClick={() => setAuthMode('login')}
++                >
++                  <Lock size={16} />
++                  <span>Anmelden</span>
++                </button>
++              </div>
++            </div>
++          ) : (
++            <form onSubmit={handleAuthSubmit} className="stack-form mt-2">
++              <div className="flex items-center justify-between mb-2">
++                <h3 className="font-semibold text-sm">
++                  {authMode === 'register' ? 'DHBW-Konto registrieren' : 'Mit DHBW-Konto anmelden'}
++                </h3>
++                <button
++                  type="button"
++                  className="text-xs text-slate-400 hover:text-white"
++                  onClick={() => setAuthMode(authMode === 'register' ? 'login' : 'register')}
++                >
++                  {authMode === 'register' ? 'Schon registriert? Anmelden' : 'Neu hier? Registrieren'}
++                </button>
++              </div>
++
++              <Field label="DHBW E-Mail-Adresse" hint="z. B. @bad-mergentheim.dhbw.de oder @dhbw-*.de">
++                <input
++                  type="email"
++                  className="text-input"
++                  required
++                  placeholder="name@bad-mergentheim.dhbw.de"
++                  value={authEmail}
++                  onChange={(e) => setAuthEmail(e.target.value)}
++                />
++              </Field>
++
++              <Field label="Passwort" hint="Mindestens 10 Zeichen">
++                <input
++                  type="password"
++                  className="text-input"
++                  required
++                  minLength={10}
++                  placeholder="Sicheres Passwort"
++                  value={authPassword}
++                  onChange={(e) => setAuthPassword(e.target.value)}
++                />
++              </Field>
++
++              {authMode === 'register' && (
++                <>
++                  <div className="grid grid-cols-2 gap-2">
++                    <Field label="Vorname">
++                      <input
++                        type="text"
++                        className="text-input"
++                        placeholder="Max"
++                        value={authFirstName}
++                        onChange={(e) => setAuthFirstName(e.target.value)}
++                      />
++                    </Field>
++                    <Field label="Nachname">
++                      <input
++                        type="text"
++                        className="text-input"
++                        placeholder="Mustermann"
++                        value={authLastName}
++                        onChange={(e) => setAuthLastName(e.target.value)}
++                      />
++                    </Field>
++                  </div>
++                  <Field label="Studiengang">
++                    <input
++                      type="text"
++                      className="text-input"
++                      placeholder="Wirtschaftsinformatik"
++                      value={authStudy}
++                      onChange={(e) => setAuthStudy(e.target.value)}
++                    />
++                  </Field>
++                </>
++              )}
++
++              <div className="flex gap-2 mt-2">
++                <button
++                  type="button"
++                  className="button button-secondary flex-1"
++                  onClick={() => setAuthMode('view')}
++                >
++                  Abbrechen
++                </button>
++                <button
++                  type="submit"
++                  className="button button-primary flex-1"
++                  disabled={authBusy || !online}
++                >
++                  {authBusy
++                    ? 'Wird ausgeführt...'
++                    : authMode === 'register'
++                    ? 'Konto erstellen'
++                    : 'Anmelden'}
++                </button>
++              </div>
++            </form>
++          )}
++
++          {/* Recovery Code Section */}
++          <div className="pt-4 mt-4 border-t border-slate-800">
++            <h3 className="sub-heading flex items-center gap-2">
++              <KeyRound size={16} /> Wiederherstellungscode
++            </h3>
++            <p className="muted-copy text-xs">
++              Alternativ kannst du einen Einmal-Code erzeugen, um deine Gerätesitzung ohne Passwort auf ein
++              neues Handy zu übertragen.
++            </p>
++            {!session?.recoveryConfigured && (
++              <button
++                type="button"
++                className="button button-secondary mt-2"
++                disabled={!online || busy}
++                onClick={() => void createCode()}
++              >
++                Einmal-Code erstellen
++              </button>
++            )}
++            {session?.recoveryConfigured && !recoveryCode && (
++              <InlineNotice tone="success">
++                Ein Wiederherstellungscode ist eingerichtet. Bewahre ihn sicher auf.
++              </InlineNotice>
++            )}
++            {recoveryCode && (
++              <div className="recovery-code-panel mt-2">
++                <p className="text-xs text-amber-300">
++                  Wird nur jetzt angezeigt! Speichere den Code sicher:
++                </p>
++                <code className="text-xs">{recoveryCode}</code>
++                <button type="button" className="button button-secondary compact-button" onClick={() => void copyCode()}>
++                  {copied ? <Check size={14} /> : <Copy size={14} />}
++                  <span>{copied ? 'Kopiert' : 'Code kopieren'}</span>
++                </button>
++              </div>
++            )}
++
++            <form className="stack-form recovery-form mt-3" onSubmit={submitRecovery}>
++              <Field label="Vorhandenen Code eingeben">
++                <input
++                  className="text-input"
++                  value={restoreInput}
++                  onChange={(event) => setRestoreInput(event.target.value)}
++                  autoComplete="off"
++                  spellCheck={false}
++                  placeholder="Code einfügen"
++                  required
++                />
++              </Field>
++              <button
++                type="submit"
++                className="button button-primary compact-button"
++                disabled={!online || busy || restoreInput.trim().length < 20}
++              >
++                Code anwenden
++              </button>
++            </form>
++          </div>
+         </section>
+ 
++        {/* 3. Privacy & DSGVO */}
+         <section className="surface profile-card privacy-card">
+-          <span className="icon-badge"><ShieldCheck size={19} aria-hidden="true" /></span>
+-          <SectionTitle title="Datenschutz" />
+-          <ul className="privacy-list"><li>Trainings, Ziele und Reservierungen sind nur für dein Profil sichtbar.</li><li>Die gemeinsame Belegung zeigt ausschließlich eine Summe manueller Check-ins.</li><li>Besuche werden nach 90 Tagen automatisch entfernt.</li><li>Du kannst deine persönlichen App-Daten hier löschen.</li></ul>
+-          <button type="button" className="button button-danger" disabled={!online || busy} onClick={onDeleteData}><Trash2 size={16} aria-hidden="true" />Meine App-Daten löschen</button>
++          <span className="icon-badge">
++            <ShieldCheck size={19} aria-hidden="true" />
++          </span>
++          <SectionTitle title="Datenschutz & Datenhoheit" />
++          <ul className="privacy-list">
++            <li>Ausschließlich autorisierte DHBW-Angehörige haben Zugriff auf die Plattform.</li>
++            <li>
++              Deine Anwesenheitssichtbarkeit ist freiwillig und kann jederzeit mit einem Klick auf privat
++              gestellt werden.
++            </li>
++            <li>E-Mail-Adressen und private Kontaktdaten werden niemals öffentlich im Client geteilt.</li>
++            <li>Besuche und Check-ins werden nach 90 Tagen automatisch gelöscht.</li>
++            <li>Du hast das Recht, alle deine persönlichen Daten und Kontoeinträge vollständig zu löschen.</li>
++          </ul>
++          <button
++            type="button"
++            className="button button-danger"
++            disabled={!online || busy}
++            onClick={onDeleteData}
++          >
++            <Trash2 size={16} aria-hidden="true" />
++            <span>Alle meine App-Daten löschen</span>
++          </button>
+         </section>
+       </div>
+     </>
+diff --git a/src/features/gym/components.tsx b/src/features/gym/components.tsx
+index 134d0d3..7234805 100644
+--- a/src/features/gym/components.tsx
++++ b/src/features/gym/components.tsx
+@@ -1,11 +1,12 @@
+ import type { ReactNode } from 'react';
+-import { Activity, CalendarDays, ChartNoAxesColumnIncreasing, Dumbbell, House, UserRound } from 'lucide-react';
++import { Activity, CalendarDays, ChartNoAxesColumnIncreasing, Dumbbell, House, UserRound, Users } from 'lucide-react';
+ 
+-export type GymPage = 'dashboard' | 'calendar' | 'training' | 'progress' | 'profile';
++export type GymPage = 'dashboard' | 'calendar' | 'community' | 'training' | 'progress' | 'profile';
+ 
+ const navigation: Array<{ id: GymPage; label: string; Icon: typeof House }> = [
+   { id: 'dashboard', label: 'Übersicht', Icon: House },
+   { id: 'calendar', label: 'Kalender', Icon: CalendarDays },
++  { id: 'community', label: 'Community', Icon: Users },
+   { id: 'training', label: 'Training', Icon: Dumbbell },
+   { id: 'progress', label: 'Fortschritt', Icon: ChartNoAxesColumnIncreasing },
+   { id: 'profile', label: 'Profil', Icon: UserRound },
+diff --git a/src/features/gym/format.ts b/src/features/gym/format.ts
+index d74bfe7..086d6b5 100644
+--- a/src/features/gym/format.ts
++++ b/src/features/gym/format.ts
+@@ -50,3 +50,44 @@ export function calculateWorkoutVolume(workouts: Array<{ exercises: Array<{ sets
+     (exerciseTotal, exercise) => exerciseTotal + exercise.sets.reduce((setTotal, set) => setTotal + set.reps * set.weightKg, 0), 0,
+   ), 0);
+ }
++
++export function getCalendarWeekNumber(date: Date): number {
++  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
++  const dayNum = d.getUTCDay() || 7;
++  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
++  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
++  return Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
++}
++
++export function formatShortDate(value: string | Date): string {
++  return new Intl.DateTimeFormat('de-DE', { day: '2-digit', month: 'short' }).format(new Date(value));
++}
++
++export function formatDayOfWeek(date: Date, format: 'short' | 'long' | 'narrow' = 'short'): string {
++  return new Intl.DateTimeFormat('de-DE', { weekday: format }).format(date);
++}
++
++export function isSameDay(d1: Date | string, d2: Date | string): boolean {
++  const date1 = new Date(d1);
++  const date2 = new Date(d2);
++  return (
++    date1.getFullYear() === date2.getFullYear() &&
++    date1.getMonth() === date2.getMonth() &&
++    date1.getDate() === date2.getDate()
++  );
++}
++
++export function addWeeks(date: Date, amount: number): Date {
++  const result = new Date(date);
++  result.setDate(result.getDate() + amount * 7);
++  return result;
++}
++
++export function getDaysOfWeek(startOfWeek: Date): Date[] {
++  return Array.from({ length: 7 }, (_, i) => {
++    const d = new Date(startOfWeek);
++    d.setDate(d.getDate() + i);
++    return d;
++  });
++}
++
+diff --git a/src/features/gym/gym.css b/src/features/gym/gym.css
+index a1c5b80..e4eddf2 100644
+--- a/src/features/gym/gym.css
++++ b/src/features/gym/gym.css
+@@ -627,3 +627,1269 @@
+     min-height: 48px;
+   }
+ }
++
++/* ==========================================================================
++   DHBW Gym Community & Live Attendance Styles
++   ========================================================================== */
++
++/* Community Subnavigation Tabs */
++.community-subnav {
++  display: flex;
++  gap: 8px;
++  margin-bottom: 20px;
++  background: var(--gym-surface);
++  border: 1px solid var(--gym-border);
++  border-radius: 14px;
++  padding: 5px;
++  max-width: 480px;
++}
++
++.community-tab-button {
++  flex: 1;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  gap: 8px;
++  min-height: 42px;
++  padding: 8px 14px;
++  background: transparent;
++  border: none;
++  border-radius: 10px;
++  color: var(--gym-muted);
++  font-size: 13px;
++  font-weight: 600;
++  cursor: pointer;
++  transition: all 0.15s ease;
++}
++
++.community-tab-button:hover {
++  color: var(--gym-text);
++  background: rgba(255, 255, 255, 0.04);
++}
++
++.community-tab-button.is-active {
++  background: var(--gym-surface-raised);
++  color: #fff;
++  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
++  border: 1px solid var(--gym-border-strong);
++}
++
++.badge-count {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  min-width: 20px;
++  height: 20px;
++  padding: 0 6px;
++  background: #f59e0b;
++  color: #0b0f17;
++  font-size: 11px;
++  font-weight: 700;
++  border-radius: 999px;
++}
++
++/* Community Filter Bar */
++.community-filter-bar {
++  display: flex;
++  flex-direction: column;
++  gap: 14px;
++  padding: 16px 20px;
++  margin-bottom: 24px;
++}
++
++.community-search-box {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  background: rgba(0, 0, 0, 0.25);
++  border: 1px solid var(--gym-border);
++  border-radius: 12px;
++  padding: 0 14px;
++}
++
++.community-search-box:focus-within {
++  border-color: var(--gym-accent);
++}
++
++.community-search-input {
++  flex: 1;
++  background: transparent;
++  border: none;
++  color: var(--gym-text);
++  font-size: 14px;
++  min-height: 42px;
++  outline: none;
++}
++
++.filter-chips-row {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 16px;
++}
++
++.filter-group {
++  display: flex;
++  align-items: center;
++  flex-wrap: wrap;
++  gap: 6px;
++}
++
++.filter-group-label {
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++  font-size: 12px;
++  font-weight: 600;
++  color: var(--gym-muted);
++  margin-right: 2px;
++}
++
++.filter-chip {
++  padding: 5px 12px;
++  border-radius: 8px;
++  font-size: 12px;
++  font-weight: 500;
++  background: rgba(255, 255, 255, 0.04);
++  border: 1px solid var(--gym-border);
++  color: var(--gym-muted);
++  cursor: pointer;
++  transition: all 0.15s ease;
++}
++
++.filter-chip:hover {
++  color: var(--gym-text);
++  border-color: var(--gym-border-strong);
++}
++
++.filter-chip.is-active {
++  background: rgba(59, 130, 246, 0.15);
++  border-color: #3b82f6;
++  color: #60a5fa;
++  font-weight: 600;
++}
++
++/* Members Grid */
++.community-members-grid {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
++  gap: 16px;
++  margin-bottom: 32px;
++}
++
++.member-card {
++  display: flex;
++  flex-direction: column;
++  padding: 20px;
++  border-radius: 16px;
++  background: var(--gym-surface);
++  border: 1px solid var(--gym-border);
++  transition: transform 0.15s ease, border-color 0.15s ease;
++}
++
++.member-card:hover {
++  border-color: var(--gym-border-strong);
++}
++
++.member-card-header {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  margin-bottom: 12px;
++}
++
++.member-avatar {
++  width: 44px;
++  height: 44px;
++  border-radius: 12px;
++  background: linear-gradient(135deg, #1e293b, #0f172a);
++  border: 1px solid #334155;
++  color: #38bdf8;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  font-weight: 700;
++  font-size: 16px;
++  flex-shrink: 0;
++}
++
++.member-info {
++  flex: 1;
++  min-width: 0;
++}
++
++.member-name {
++  font-size: 16px;
++  font-weight: 700;
++  color: var(--gym-text);
++  margin: 0;
++}
++
++.member-study {
++  font-size: 12px;
++  color: var(--gym-muted);
++  margin: 2px 0 0;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.self-tag {
++  font-size: 10px;
++  font-weight: 700;
++  text-transform: uppercase;
++  padding: 2px 6px;
++  background: rgba(59, 130, 246, 0.2);
++  color: #60a5fa;
++  border-radius: 4px;
++}
++
++.member-presence-status {
++  margin-bottom: 12px;
++}
++
++.status-live-pill {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  padding: 4px 10px;
++  background: rgba(16, 185, 129, 0.12);
++  border: 1px solid rgba(16, 185, 129, 0.3);
++  color: #34d399;
++  font-size: 12px;
++  font-weight: 600;
++  border-radius: 8px;
++}
++
++.live-dot {
++  width: 7px;
++  height: 7px;
++  border-radius: 999px;
++  background: #10b981;
++  box-shadow: 0 0 8px #10b981;
++  animation: pulse-dot 2s infinite;
++}
++
++@keyframes pulse-dot {
++  0%, 100% { opacity: 1; transform: scale(1); }
++  50% { opacity: 0.5; transform: scale(0.85); }
++}
++
++.status-planned-pill {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  padding: 4px 10px;
++  background: rgba(59, 130, 246, 0.1);
++  border: 1px solid rgba(59, 130, 246, 0.25);
++  color: #60a5fa;
++  font-size: 12px;
++  font-weight: 500;
++  border-radius: 8px;
++}
++
++.status-idle-pill {
++  font-size: 12px;
++  color: var(--gym-muted);
++}
++
++.member-tags-container {
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++  margin-bottom: 8px;
++}
++
++.member-tags-label {
++  font-size: 11px;
++  font-weight: 600;
++  text-transform: uppercase;
++  color: var(--gym-muted);
++}
++
++.member-tags {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 4px;
++}
++
++.member-tag {
++  font-size: 11px;
++  padding: 3px 8px;
++  border-radius: 6px;
++  background: rgba(255, 255, 255, 0.05);
++  color: var(--gym-text);
++  border: 1px solid var(--gym-border);
++}
++
++.member-tag-time {
++  font-size: 11px;
++  padding: 3px 8px;
++  border-radius: 6px;
++  background: rgba(245, 158, 11, 0.1);
++  border: 1px solid rgba(245, 158, 11, 0.2);
++  color: #fbbf24;
++}
++
++.member-bio {
++  font-size: 12px;
++  color: var(--gym-muted);
++  font-style: italic;
++  margin: 8px 0 14px;
++  line-height: 1.5;
++}
++
++.member-card-footer {
++  margin-top: auto;
++  padding-top: 12px;
++}
++
++/* Partner Requests Styling */
++.community-requests-panel {
++  padding: 24px;
++}
++
++.partner-request-row {
++  display: flex;
++  align-items: flex-start;
++  justify-content: space-between;
++  gap: 12px;
++  padding: 14px 16px;
++}
++
++.request-status-pill {
++  font-size: 11px;
++  font-weight: 600;
++  padding: 2px 8px;
++  border-radius: 6px;
++}
++
++.request-status-pill.status-pending {
++  background: rgba(245, 158, 11, 0.15);
++  color: #fbbf24;
++  border: 1px solid rgba(245, 158, 11, 0.3);
++}
++
++.request-status-pill.status-accepted {
++  background: rgba(16, 185, 129, 0.15);
++  color: #34d399;
++  border: 1px solid rgba(16, 185, 129, 0.3);
++}
++
++.request-status-pill.status-declined {
++  background: rgba(239, 68, 68, 0.15);
++  color: #f87171;
++  border: 1px solid rgba(239, 68, 68, 0.3);
++}
++
++.request-note {
++  font-size: 13px;
++  color: var(--gym-text);
++  font-style: italic;
++  margin: 6px 0 0;
++}
++
++.request-actions {
++  display: flex;
++  gap: 6px;
++}
++
++.compact-button {
++  min-height: 34px !important;
++  padding: 6px 12px !important;
++  font-size: 12px !important;
++}
++
++/* Live Presence Bar in Calendar */
++.live-presence-bar {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 16px;
++  padding: 16px 20px;
++  margin-bottom: 20px;
++  border-radius: 14px;
++  background: var(--gym-surface);
++  border: 1px solid var(--gym-border);
++}
++
++.live-presence-bar.is-checked-in {
++  background: rgba(16, 185, 129, 0.08);
++  border-color: rgba(16, 185, 129, 0.3);
++}
++
++.live-pulse-indicator {
++  width: 10px;
++  height: 10px;
++  border-radius: 999px;
++  background: var(--gym-muted);
++}
++
++.live-pulse-indicator.active {
++  background: #10b981;
++  box-shadow: 0 0 10px #10b981;
++  animation: pulse-dot 1.8s infinite;
++}
++
++.live-title {
++  font-size: 15px;
++  font-weight: 700;
++  color: var(--gym-text);
++}
++
++.live-subtitle {
++  font-size: 12px;
++  color: var(--gym-muted);
++  margin: 3px 0 0;
++}
++
++/* Active Checkins Panel */
++.active-checkins-panel {
++  padding: 16px 20px;
++  margin-bottom: 20px;
++  border-radius: 14px;
++  background: rgba(16, 185, 129, 0.05);
++  border: 1px solid rgba(16, 185, 129, 0.2);
++}
++
++.active-members-chip-list {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 8px;
++}
++
++.active-member-chip {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  padding: 6px 12px;
++  background: var(--gym-surface);
++  border: 1px solid var(--gym-border);
++  border-radius: 10px;
++}
++
++.active-member-chip.is-mine {
++  border-color: #10b981;
++  background: rgba(16, 185, 129, 0.1);
++}
++
++.chip-avatar {
++  width: 24px;
++  height: 24px;
++  border-radius: 6px;
++  background: #10b981;
++  color: #0b0f17;
++  font-size: 12px;
++  font-weight: 700;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++}
++
++.chip-text {
++  display: flex;
++  flex-direction: column;
++}
++
++.chip-name {
++  font-size: 12px;
++  font-weight: 600;
++  color: var(--gym-text);
++}
++
++.chip-sub {
++  font-size: 10px;
++  color: var(--gym-muted);
++}
++
++/* Entry Type Selection in Calendar */
++.entry-type-selector {
++  display: flex;
++  gap: 8px;
++}
++
++.entry-type-btn {
++  flex: 1;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  gap: 8px;
++  min-height: 44px;
++  padding: 8px 12px;
++  border-radius: 10px;
++  background: rgba(255, 255, 255, 0.03);
++  border: 1px solid var(--gym-border);
++  color: var(--gym-muted);
++  font-size: 13px;
++  font-weight: 600;
++  cursor: pointer;
++  transition: all 0.15s ease;
++}
++
++.entry-type-btn:hover {
++  border-color: var(--gym-border-strong);
++  color: var(--gym-text);
++}
++
++.entry-type-btn.is-active.type-planned {
++  background: rgba(59, 130, 246, 0.15);
++  border-color: #3b82f6;
++  color: #60a5fa;
++}
++
++.entry-type-btn.is-active.type-reservation {
++  background: rgba(139, 92, 246, 0.15);
++  border-color: #8b5cf6;
++  color: #a78bfa;
++}
++
++/* Calendar Filter Tabs */
++.calendar-type-filters {
++  display: flex;
++  gap: 4px;
++  background: rgba(0, 0, 0, 0.3);
++  padding: 3px;
++  border-radius: 8px;
++  border: 1px solid var(--gym-border);
++}
++
++.filter-tab {
++  padding: 4px 10px;
++  border-radius: 6px;
++  font-size: 12px;
++  font-weight: 600;
++  background: transparent;
++  border: none;
++  color: var(--gym-muted);
++  cursor: pointer;
++}
++
++.filter-tab.is-active {
++  background: var(--gym-surface-raised);
++  color: #fff;
++}
++
++/* Event Badges and Borders */
++.entry-badge {
++  font-size: 10px;
++  font-weight: 700;
++  text-transform: uppercase;
++  padding: 2px 7px;
++  border-radius: 4px;
++}
++
++.badge-planned {
++  background: rgba(59, 130, 246, 0.15);
++  color: #60a5fa;
++  border: 1px solid rgba(59, 130, 246, 0.3);
++}
++
++.badge-reservation {
++  background: rgba(139, 92, 246, 0.15);
++  color: #c084fc;
++  border: 1px solid rgba(139, 92, 246, 0.3);
++}
++
++.icon-planned {
++  color: #60a5fa !important;
++}
++
++.icon-reservation {
++  color: #c084fc !important;
++}
++
++.event-metadata {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  font-size: 12px;
++  color: var(--gym-muted);
++  margin-top: 3px;
++}
++
++.event-goals-row {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 4px;
++  margin-top: 4px;
++}
++
++.micro-tag {
++  font-size: 10px;
++  padding: 2px 6px;
++  background: rgba(255, 255, 255, 0.05);
++  border-radius: 4px;
++  color: var(--gym-muted);
++}
++
++/* Profile Goal / Time Chips */
++.checkbox-chips-grid {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 6px;
++}
++
++.goal-chip-button {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  padding: 7px 12px;
++  border-radius: 8px;
++  background: rgba(255, 255, 255, 0.03);
++  border: 1px solid var(--gym-border);
++  color: var(--gym-muted);
++  font-size: 12px;
++  font-weight: 500;
++  cursor: pointer;
++  transition: all 0.15s ease;
++}
++
++.goal-chip-button:hover {
++  border-color: var(--gym-border-strong);
++  color: var(--gym-text);
++}
++
++.goal-chip-button.is-active {
++  background: rgba(59, 130, 246, 0.15);
++  border-color: #3b82f6;
++  color: #93c5fd;
++  font-weight: 600;
++}
++
++/* Privacy Toggle Card in Profile */
++.privacy-toggle-box {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 16px;
++  padding: 14px 16px;
++  border-radius: 12px;
++  margin: 12px 0;
++  transition: all 0.2s ease;
++}
++
++.privacy-toggle-box.active {
++  background: rgba(16, 185, 129, 0.08);
++  border: 1px solid rgba(16, 185, 129, 0.3);
++}
++
++.privacy-toggle-box.private {
++  background: rgba(245, 158, 11, 0.08);
++  border: 1px solid rgba(245, 158, 11, 0.3);
++}
++
++/* Modals */
++.modal-backdrop {
++  position: fixed;
++  inset: 0;
++  background: rgba(0, 0, 0, 0.7);
++  backdrop-filter: blur(4px);
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  padding: 16px;
++  z-index: 100;
++}
++
++.modal-card {
++  width: 100%;
++  max-width: 480px;
++  padding: 24px;
++  border-radius: 18px;
++  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
++  border: 1px solid var(--gym-border-strong);
++}
++
++.modal-header {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 12px;
++  margin-bottom: 16px;
++}
++
++.modal-header h2 {
++  font-size: 17px;
++  font-weight: 700;
++  margin: 0;
++}
++
++.modal-actions {
++  display: flex;
++  gap: 10px;
++  justify-content: flex-end;
++  margin-top: 16px;
++}
++
++/* ==========================================================================
++   Wochenansicht (Weekly Calendar View)
++   ========================================================================== */
++.calendar-view-header {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  flex-wrap: wrap;
++  gap: 12px;
++  margin-bottom: 16px;
++}
++
++.view-mode-tabs {
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++  padding: 4px;
++  border-radius: 10px;
++  background: rgba(0, 0, 0, 0.35);
++  border: 1px solid var(--gym-border);
++}
++
++.view-mode-btn {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  padding: 6px 14px;
++  border-radius: 7px;
++  font-size: 12px;
++  font-weight: 600;
++  color: var(--gym-muted);
++  background: transparent;
++  border: none;
++  cursor: pointer;
++  transition: all 0.15s ease;
++}
++
++.view-mode-btn:hover {
++  color: var(--gym-text);
++}
++
++.view-mode-btn.is-active {
++  background: var(--gym-surface-2);
++  color: var(--gym-text);
++  border: 1px solid var(--gym-border-strong);
++  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
++}
++
++.week-panel {
++  padding: 22px;
++  margin-bottom: 20px;
++}
++
++.week-toolbar {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  flex-wrap: wrap;
++  gap: 16px;
++  padding-bottom: 18px;
++  border-bottom: 1px solid var(--gym-border);
++}
++
++.week-nav-group {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++}
++
++.week-nav-btn {
++  display: grid;
++  place-items: center;
++  width: 34px;
++  height: 34px;
++  border-radius: 9px;
++  background: var(--gym-surface-2);
++  border: 1px solid var(--gym-border);
++  color: var(--gym-muted);
++  cursor: pointer;
++  transition: all 0.15s ease;
++}
++
++.week-nav-btn:hover:not(:disabled) {
++  color: var(--gym-text);
++  border-color: var(--gym-border-strong);
++  background: #202933;
++}
++
++.week-nav-btn:disabled {
++  opacity: 0.4;
++  cursor: not-allowed;
++}
++
++.week-today-btn {
++  padding: 0 12px;
++  height: 34px;
++  border-radius: 9px;
++  background: var(--gym-surface-2);
++  border: 1px solid var(--gym-border);
++  color: var(--gym-text);
++  font-size: 12px;
++  font-weight: 600;
++  cursor: pointer;
++  transition: all 0.15s ease;
++}
++
++.week-today-btn:hover {
++  background: #202933;
++  border-color: var(--gym-border-strong);
++}
++
++.week-today-btn.is-current {
++  border-color: rgba(167, 216, 182, 0.35);
++  color: var(--gym-accent);
++}
++
++.week-kw-badge {
++  display: inline-flex;
++  align-items: center;
++  gap: 8px;
++  padding: 6px 12px;
++  border-radius: 8px;
++  background: rgba(255, 255, 255, 0.04);
++  border: 1px solid var(--gym-border);
++  font-size: 13px;
++  font-weight: 650;
++  color: var(--gym-text);
++}
++
++.week-kw-badge small {
++  color: var(--gym-muted);
++  font-weight: 500;
++}
++
++.week-quick-stats {
++  display: flex;
++  align-items: center;
++  flex-wrap: wrap;
++  gap: 8px;
++}
++
++.week-stat-pill {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  padding: 5px 10px;
++  border-radius: 8px;
++  font-size: 11px;
++  font-weight: 550;
++  background: rgba(255, 255, 255, 0.03);
++  border: 1px solid var(--gym-border);
++  color: var(--gym-muted);
++}
++
++.week-stat-pill strong {
++  color: var(--gym-text);
++}
++
++.week-stat-pill.pill-workout {
++  border-color: rgba(16, 185, 129, 0.25);
++  background: rgba(16, 185, 129, 0.06);
++  color: #a7f3d0;
++}
++
++.week-stat-pill.pill-planned {
++  border-color: rgba(59, 130, 246, 0.25);
++  background: rgba(59, 130, 246, 0.06);
++  color: #93c5fd;
++}
++
++.week-stat-pill.pill-community {
++  border-color: rgba(167, 216, 182, 0.25);
++  background: rgba(167, 216, 182, 0.06);
++  color: var(--gym-accent-strong);
++}
++
++/* 7-Day Grid Layout */
++.week-grid-container {
++  display: grid;
++  grid-template-columns: repeat(7, minmax(0, 1fr));
++  gap: 10px;
++  margin-top: 18px;
++}
++
++.week-day-col {
++  display: flex;
++  flex-direction: column;
++  min-height: 290px;
++  border-radius: 14px;
++  background: var(--gym-surface-2);
++  border: 1px solid var(--gym-border);
++  padding: 10px 8px;
++  cursor: pointer;
++  transition: all 0.15s ease;
++  position: relative;
++}
++
++.week-day-col:hover {
++  border-color: var(--gym-border-strong);
++  transform: translateY(-2px);
++}
++
++.week-day-col.is-today {
++  border-color: rgba(167, 216, 182, 0.45);
++  background: linear-gradient(180deg, rgba(167, 216, 182, 0.08) 0%, var(--gym-surface-2) 65%);
++}
++
++.week-day-col.is-selected {
++  border-color: var(--gym-accent);
++  box-shadow: 0 0 0 2px rgba(167, 216, 182, 0.25);
++}
++
++.week-day-header {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 4px;
++  padding-bottom: 8px;
++  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
++  margin-bottom: 8px;
++}
++
++.week-day-label-group {
++  display: flex;
++  align-items: baseline;
++  gap: 6px;
++}
++
++.week-day-name {
++  font-size: 11px;
++  font-weight: 700;
++  text-transform: uppercase;
++  letter-spacing: 0.04em;
++  color: var(--gym-muted);
++}
++
++.week-day-col.is-today .week-day-name {
++  color: var(--gym-accent-strong);
++}
++
++.week-day-number {
++  font-size: 15px;
++  font-weight: 700;
++  font-variant-numeric: tabular-nums;
++  color: var(--gym-text);
++}
++
++.week-day-today-tag {
++  font-size: 9px;
++  font-weight: 750;
++  text-transform: uppercase;
++  padding: 1px 5px;
++  border-radius: 4px;
++  background: var(--gym-accent);
++  color: #101711;
++  letter-spacing: 0.02em;
++}
++
++.week-day-events-list {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  flex: 1;
++  min-height: 180px;
++}
++
++.week-event-card {
++  display: flex;
++  flex-direction: column;
++  gap: 3px;
++  padding: 7px 8px;
++  border-radius: 9px;
++  font-size: 11px;
++  text-align: left;
++  transition: all 0.15s ease;
++  overflow: hidden;
++}
++
++.week-event-card:hover {
++  filter: brightness(1.12);
++}
++
++/* Card Type Variants */
++.week-card-workout {
++  background: rgba(16, 185, 129, 0.12);
++  border: 1px solid rgba(16, 185, 129, 0.32);
++  color: #e6fcf0;
++}
++
++.week-card-workout .week-event-icon {
++  color: #34d399;
++}
++
++.week-card-planned {
++  background: rgba(59, 130, 246, 0.12);
++  border: 1px solid rgba(59, 130, 246, 0.32);
++  color: #eff6ff;
++}
++
++.week-card-planned .week-event-icon {
++  color: #60a5fa;
++}
++
++.week-card-reservation {
++  background: rgba(139, 92, 246, 0.12);
++  border: 1px solid rgba(139, 92, 246, 0.32);
++  color: #faf5ff;
++}
++
++.week-card-reservation .week-event-icon {
++  color: #c084fc;
++}
++
++.week-card-community {
++  background: rgba(255, 255, 255, 0.035);
++  border: 1px solid rgba(255, 255, 255, 0.08);
++  color: #d1d9e2;
++}
++
++.week-card-community .week-event-icon {
++  color: var(--gym-muted);
++}
++
++.week-event-topline {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 4px;
++}
++
++.week-event-badge-label {
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++  font-size: 9px;
++  font-weight: 700;
++  text-transform: uppercase;
++  letter-spacing: 0.03em;
++}
++
++.week-event-time {
++  font-size: 10px;
++  font-variant-numeric: tabular-nums;
++  opacity: 0.85;
++}
++
++.week-event-title {
++  font-size: 11px;
++  font-weight: 650;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  line-height: 1.25;
++}
++
++.week-event-sub {
++  font-size: 10px;
++  opacity: 0.75;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.week-day-empty-placeholder {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  justify-content: center;
++  flex: 1;
++  padding: 16px 4px;
++  color: var(--gym-dim);
++  font-size: 10px;
++  text-align: center;
++  border: 1px dashed rgba(255, 255, 255, 0.06);
++  border-radius: 8px;
++}
++
++.week-day-add-action {
++  margin-top: 8px;
++  padding-top: 6px;
++  border-top: 1px solid rgba(255, 255, 255, 0.05);
++}
++
++.week-add-button {
++  width: 100%;
++  padding: 5px 0;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  gap: 4px;
++  font-size: 10px;
++  font-weight: 600;
++  color: var(--gym-dim);
++  background: transparent;
++  border: 1px dashed rgba(255, 255, 255, 0.1);
++  border-radius: 6px;
++  cursor: pointer;
++  transition: all 0.15s ease;
++}
++
++.week-add-button:hover {
++  color: var(--gym-accent);
++  border-color: rgba(167, 216, 182, 0.35);
++  background: rgba(167, 216, 182, 0.05);
++}
++
++/* Day Inspector Deep Dive Panel */
++.week-day-inspector {
++  margin-top: 20px;
++  padding: 20px;
++  border-radius: 14px;
++  background: #11161d;
++  border: 1px solid var(--gym-border-strong);
++}
++
++.inspector-header {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  flex-wrap: wrap;
++  gap: 12px;
++  margin-bottom: 16px;
++  padding-bottom: 14px;
++  border-bottom: 1px solid var(--gym-border);
++}
++
++.inspector-date-title {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++}
++
++.inspector-date-title h3 {
++  margin: 0;
++  font-size: 16px;
++  font-weight: 700;
++  color: var(--gym-text);
++}
++
++.inspector-grid {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
++  gap: 16px;
++}
++
++.inspector-section {
++  display: flex;
++  flex-direction: column;
++  gap: 10px;
++  background: var(--gym-surface-2);
++  border: 1px solid var(--gym-border);
++  border-radius: 12px;
++  padding: 14px;
++}
++
++.inspector-section-title {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  font-size: 12px;
++  font-weight: 650;
++  color: var(--gym-muted);
++}
++
++.inspector-item-card {
++  background: rgba(0, 0, 0, 0.25);
++  border: 1px solid var(--gym-border);
++  border-radius: 10px;
++  padding: 12px;
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++}
++
++.inspector-item-card.is-workout {
++  border-left: 3px solid #34d399;
++}
++
++.inspector-item-card.is-planned {
++  border-left: 3px solid #60a5fa;
++}
++
++.inspector-item-card.is-reservation {
++  border-left: 3px solid #c084fc;
++}
++
++.inspector-item-card.is-community {
++  border-left: 3px solid var(--gym-dim);
++}
++
++.inspector-item-top {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 8px;
++}
++
++.inspector-item-name {
++  font-size: 13px;
++  font-weight: 650;
++  color: var(--gym-text);
++}
++
++.inspector-exercise-list {
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++  margin-top: 6px;
++  padding-top: 6px;
++  border-top: 1px solid rgba(255, 255, 255, 0.05);
++}
++
++.inspector-exercise-row {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  font-size: 11px;
++  color: var(--gym-muted);
++}
++
++.inspector-exercise-row span:first-child {
++  color: #e2e8f0;
++  font-weight: 500;
++}
++
++/* Responsive adjustments for mobile */
++@media (max-width: 900px) {
++  .week-grid-container {
++    display: flex;
++    overflow-x: auto;
++    padding-bottom: 8px;
++    scroll-snap-type: x mandatory;
++    gap: 8px;
++  }
++
++  .week-day-col {
++    min-width: 150px;
++    flex: 0 0 150px;
++    scroll-snap-align: start;
++  }
++}
++
++@media (max-width: 600px) {
++  .week-toolbar {
++    flex-direction: column;
++    align-items: flex-start;
++  }
++
++  .week-nav-group {
++    width: 100%;
++    justify-content: space-between;
++  }
++
++  .week-quick-stats {
++    width: 100%;
++  }
++
++  .calendar-view-header {
++    flex-direction: column;
++    align-items: flex-start;
++  }
++
++  .view-mode-tabs {
++    width: 100%;
++  }
++
++  .view-mode-btn {
++    flex: 1;
++    justify-content: center;
++  }
++}
++
+diff --git a/src/services/gymRepository.ts b/src/services/gymRepository.ts
+index ee27b9f..9679588 100644
+--- a/src/services/gymRepository.ts
++++ b/src/services/gymRepository.ts
+@@ -1,5 +1,6 @@
+-﻿export interface GymSession {
+-  identity: 'anonymous-app-profile';
++export interface GymSession {
++  identity: 'anonymous-app-profile' | 'local-account';
++  email?: string | null;
+   recoveryConfigured: boolean;
+   checkedInAt: string | null;
+   checkInExpiresAt: string | null;
+@@ -66,14 +67,102 @@ export interface GymAvailability {
+   availablePlaces: number | null;
+ }
+ 
++export interface CalendarEventItem {
++  id: string;
++  startsAt: string;
++  endsAt: string;
++  title: string;
++  entryType: 'planned' | 'reservation';
++  isMine: boolean;
++  userName?: string;
++  courseOfStudy?: string;
++  userGoals?: string[];
++}
++
++export interface ActiveCheckInItem {
++  id: string;
++  checkedInAt: string;
++  expiresAt: string;
++  isMine: boolean;
++  userName: string;
++  courseOfStudy?: string;
++  trainingGoals?: string[];
++}
++
++export interface CalendarDataResponse {
++  events: CalendarEventItem[];
++  activeCheckIns: ActiveCheckInItem[];
++  serverTime: string;
++}
++
++export interface CommunityProfile {
++  principalId: string;
++  firstName: string;
++  lastNameInitial: string;
++  courseOfStudy: string;
++  trainingGoals: string[];
++  preferredTimes: string[];
++  interests: string[];
++  bio: string;
++  isPublicPresence: boolean;
++  updatedAt: string;
++}
++
++export interface CommunityMember {
++  id: string;
++  firstName: string;
++  lastNameInitial: string;
++  courseOfStudy: string;
++  trainingGoals: string[];
++  preferredTimes: string[];
++  interests: string[];
++  bio: string;
++  isPublicPresence: boolean;
++  activeNow: boolean;
++  plannedNext: string | null;
++  isSelf: boolean;
++}
++
++export interface TrainingPartnerRequest {
++  id: string;
++  senderId: string;
++  receiverId: string;
++  senderName: string;
++  receiverName: string;
++  proposedDate: string | null;
++  note: string;
++  status: 'pending' | 'accepted' | 'declined' | 'cancelled';
++  isIncoming: boolean;
++  createdAt: string;
++  updatedAt: string;
++}
++
+ export interface GymRepository {
+   getSession(): Promise<GymSession>;
+   getOccupancy(range?: OccupancyRange): Promise<OccupancySnapshot>;
+   setCheckedIn(checkedIn: boolean): Promise<void>;
+   getBookings(from?: string, to?: string): Promise<{ slots: SharedBookingSlot[]; capacityConfigured: boolean }>;
+   getMyBookings(): Promise<GymBooking[]>;
++  getCalendarEvents(from?: string, to?: string): Promise<CalendarDataResponse>;
++  getCommunityProfile(): Promise<CommunityProfile>;
++  updateCommunityProfile(input: Partial<CommunityProfile>): Promise<CommunityProfile>;
++  getCommunityMembers(): Promise<CommunityMember[]>;
++  getPartnerRequests(): Promise<TrainingPartnerRequest[]>;
++  sendPartnerRequest(receiverId: string, note?: string, proposedDate?: string): Promise<{ id: string }>;
++  respondToPartnerRequest(id: string, status: 'accepted' | 'declined' | 'cancelled'): Promise<{ id: string; status: string }>;
++  registerWithDhbw(input: {
++    email: string;
++    password: string;
++    firstName?: string;
++    lastNameInitial?: string;
++    courseOfStudy?: string;
++    trainingGoals?: string[];
++    preferredTimes?: string[];
++  }): Promise<void>;
++  login(email: string, password: string): Promise<void>;
++  logout(): Promise<void>;
+   getAvailability(startAt: string, durationMinutes: number): Promise<GymAvailability>;
+-  createBooking(input: { startsAt: string; durationMinutes: number; title?: string }): Promise<GymBooking>;
++  createBooking(input: { startsAt: string; durationMinutes: number; title?: string; entryType?: 'planned' | 'reservation' }): Promise<GymBooking>;
+   deleteBooking(id: string): Promise<void>;
+   getVisits(): Promise<GymVisit[]>;
+   getWorkouts(): Promise<WorkoutLog[]>;
+@@ -155,6 +244,59 @@ export function createGymRepository(fetcher: FetchLike = fetch): GymRepository {
+       const result = await request<{ bookings: GymBooking[] }>('/api/gym/my/bookings');
+       return result.bookings;
+     },
++    async getCalendarEvents(from, to) {
++      const query = new URLSearchParams();
++      if (from) query.set('from', from);
++      if (to) query.set('to', to);
++      const suffix = query.toString() ? `?${query.toString()}` : '';
++      return request<CalendarDataResponse>(`/api/gym/calendar/events${suffix}`);
++    },
++    async getCommunityProfile() {
++      const result = await request<{ profile: CommunityProfile }>('/api/gym/profile/community');
++      return result.profile;
++    },
++    async updateCommunityProfile(input) {
++      const result = await request<{ profile: CommunityProfile }>('/api/gym/profile/community', {
++        method: 'PUT',
++        body: JSON.stringify(input),
++      });
++      return result.profile;
++    },
++    async getCommunityMembers() {
++      const result = await request<{ members: CommunityMember[] }>('/api/gym/community/members');
++      return result.members;
++    },
++    async getPartnerRequests() {
++      const result = await request<{ requests: TrainingPartnerRequest[] }>('/api/gym/community/partner-requests');
++      return result.requests;
++    },
++    async sendPartnerRequest(receiverId, note, proposedDate) {
++      return request<{ id: string }>('/api/gym/community/partner-requests', {
++        method: 'POST',
++        body: JSON.stringify({ receiverId, note, proposedDate }),
++      });
++    },
++    async respondToPartnerRequest(id, status) {
++      return request<{ id: string; status: string }>(`/api/gym/community/partner-requests/${encodeURIComponent(id)}`, {
++        method: 'PUT',
++        body: JSON.stringify({ status }),
++      });
++    },
++    async registerWithDhbw(input) {
++      await request('/api/gym/register', {
++        method: 'POST',
++        body: JSON.stringify(input),
++      });
++    },
++    async login(email, password) {
++      await request('/api/gym/login', {
++        method: 'POST',
++        body: JSON.stringify({ email, password }),
++      });
++    },
++    async logout() {
++      await request('/api/gym/logout', { method: 'POST' });
++    },
+     getAvailability(startAt, durationMinutes) {
+       const query = new URLSearchParams({ startAt, durationMinutes: String(durationMinutes) });
+       return request(`/api/gym/availability?${query.toString()}`);
+diff --git a/src/services/presenceWidget.ts b/src/services/presenceWidget.ts
+index 8b5c4e7..59d5191 100644
+--- a/src/services/presenceWidget.ts
++++ b/src/services/presenceWidget.ts
+@@ -1,39 +1,16 @@
+-import { Capacitor } from '@capacitor/core';
+-import { WidgetBridgePlugin } from 'capacitor-widget-bridge';
+ import { EMPTY_PRESENCE_STATE, parsePresence, type PresenceState } from './presenceState';
+ 
+ const STORAGE_KEY = 'campusGymPresence';
+-const STORAGE_GROUP = 'group.de.teqkoiii.campusgym';
+-const ANDROID_WIDGET_PROVIDER = 'de.teqkoiii.campusgym.PresenceWidgetProvider';
+-let widgetRegistration: Promise<void> | undefined;
+ let browserSessionPresence = EMPTY_PRESENCE_STATE;
+ 
+-async function prepareNativeWidget(): Promise<void> {
+-  if (!Capacitor.isNativePlatform() || Capacitor.getPlatform() !== 'android') return;
+-  widgetRegistration ??= WidgetBridgePlugin.setRegisteredWidgets({
+-    widgets: [ANDROID_WIDGET_PROVIDER],
+-  }).then(() => undefined);
+-  await widgetRegistration;
+-}
+-
+ export async function getPresenceState(): Promise<PresenceState> {
+-  if (!Capacitor.isNativePlatform()) {
+-    try {
+-      const stored = window.localStorage.getItem(STORAGE_KEY);
+-      if (stored === null) return browserSessionPresence;
+-      browserSessionPresence = parsePresence(stored);
+-      return browserSessionPresence;
+-    } catch {
+-      return browserSessionPresence;
+-    }
+-  }
+-
+   try {
+-    await prepareNativeWidget();
+-    const result = await WidgetBridgePlugin.getItem({ key: STORAGE_KEY, group: STORAGE_GROUP });
+-    return parsePresence(result.results);
++    const stored = window.localStorage.getItem(STORAGE_KEY);
++    if (stored === null) return browserSessionPresence;
++    browserSessionPresence = parsePresence(stored);
++    return browserSessionPresence;
+   } catch {
+-    return EMPTY_PRESENCE_STATE;
++    return browserSessionPresence;
+   }
+ }
+ 
+@@ -44,24 +21,11 @@ export async function setPresenceState(isPresent: boolean): Promise<PresenceStat
+     scope: 'this-device-demo',
+   };
+   const serialized = JSON.stringify(next);
+-
+-  if (!Capacitor.isNativePlatform()) {
+-    browserSessionPresence = next;
+-    try {
+-      window.localStorage.setItem(STORAGE_KEY, serialized);
+-    } catch {
+-      // Keep the status for this browser session if persistent storage is unavailable.
+-    }
+-    return next;
++  browserSessionPresence = next;
++  try {
++    window.localStorage.setItem(STORAGE_KEY, serialized);
++  } catch {
++    // Keep the status for this browser session if persistent storage is unavailable.
+   }
+-
+-  await prepareNativeWidget();
+-  const result = await WidgetBridgePlugin.setItem({
+-    key: STORAGE_KEY,
+-    value: serialized,
+-    group: STORAGE_GROUP,
+-  });
+-  if (!result.results) throw new Error('Presence could not be saved on this device');
+-  await WidgetBridgePlugin.reloadAllTimelines();
+   return next;
+ }
+-- 
+2.34.1
+

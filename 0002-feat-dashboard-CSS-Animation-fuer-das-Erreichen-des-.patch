@@ -1,0 +1,923 @@
+From 231a9e621aa428520d22ce44444d025759b84165 Mon Sep 17 00:00:00 2001
+From: DHBW Gym Developer <dreamskxng@gmail.com>
+Date: Mon, 19 Oct 2026 20:07:25 +0000
+Subject: [PATCH 2/2] feat(dashboard): CSS-Animation fuer das Erreichen des
+ woechentlichen Trainingsziels
+
+---
+ src/features/gym/Dashboard.tsx | 341 +++++++++++++++++++++--
+ src/features/gym/GymApp.tsx    |   1 +
+ src/features/gym/gym.css       | 484 +++++++++++++++++++++++++++++++++
+ 3 files changed, 809 insertions(+), 17 deletions(-)
+
+diff --git a/src/features/gym/Dashboard.tsx b/src/features/gym/Dashboard.tsx
+index 06b1009..a0ba846 100644
+--- a/src/features/gym/Dashboard.tsx
++++ b/src/features/gym/Dashboard.tsx
+@@ -1,9 +1,37 @@
+-﻿import { ArrowRight, Check, Clock3, LogIn, LogOut, Users } from 'lucide-react';
++import { useCallback, useState } from 'react';
++import {
++  ArrowRight,
++  Check,
++  Clock3,
++  Dumbbell,
++  Flame,
++  LogIn,
++  LogOut,
++  PartyPopper,
++  Sparkles,
++  Trophy,
++  Users,
++} from 'lucide-react';
+ import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+ import type { GymBooking, GymSession, OccupancySnapshot, OccupancyRange, WorkoutLog } from '../../services/gymRepository';
+ import { calculateWorkoutVolume, formatDateTime, formatTime, getThisWeekWorkouts } from './format';
+ import { InlineNotice, PageHeading, SectionTitle, type GymPage } from './components';
+ 
++const CONFETTI_PARTICLES = [
++  { id: 1, tx: '-60px', ty: '-45px', rot: '140deg', bg: '#fbbf24', size: '8px', radius: '2px', delay: '0.04s' },
++  { id: 2, tx: '55px', ty: '-50px', rot: '-120deg', bg: '#34d399', size: '9px', radius: '50%', delay: '0.1s' },
++  { id: 3, tx: '-80px', ty: '-15px', rot: '90deg', bg: '#38bdf8', size: '7px', radius: '2px', delay: '0.16s' },
++  { id: 4, tx: '75px', ty: '-20px', rot: '-80deg', bg: '#f43f5e', size: '8px', radius: '3px', delay: '0.08s' },
++  { id: 5, tx: '-35px', ty: '-65px', rot: '210deg', bg: '#a78bfa', size: '9px', radius: '50%', delay: '0.2s' },
++  { id: 6, tx: '30px', ty: '-68px', rot: '-190deg', bg: '#facc15', size: '7px', radius: '2px', delay: '0.14s' },
++  { id: 7, tx: '-95px', ty: '12px', rot: '160deg', bg: '#10b981', size: '8px', radius: '50%', delay: '0.22s' },
++  { id: 8, tx: '90px', ty: '10px', rot: '-140deg', bg: '#fb923c', size: '9px', radius: '2px', delay: '0.12s' },
++  { id: 9, tx: '-18px', ty: '-75px', rot: '180deg', bg: '#ec4899', size: '7px', radius: '50%', delay: '0.18s' },
++  { id: 10, tx: '15px', ty: '-76px', rot: '-170deg', bg: '#6ee7b7', size: '8px', radius: '2px', delay: '0.26s' },
++  { id: 11, tx: '-50px', ty: '28px', rot: '75deg', bg: '#fef08a', size: '9px', radius: '50%', delay: '0.28s' },
++  { id: 12, tx: '60px', ty: '25px', rot: '-95deg', bg: '#67e8f9', size: '7px', radius: '2px', delay: '0.15s' },
++];
++
+ export function Dashboard({
+   session,
+   occupancy,
+@@ -11,6 +39,7 @@ export function Dashboard({
+   onOccupancyRangeChange,
+   bookings,
+   workouts,
++  weeklyGoal = 3,
+   online,
+   busy,
+   error,
+@@ -23,38 +52,89 @@ export function Dashboard({
+   onOccupancyRangeChange: (range: OccupancyRange) => void;
+   bookings: GymBooking[];
+   workouts: WorkoutLog[];
++  weeklyGoal?: number;
+   online: boolean;
+   busy: boolean;
+   error: string | null;
+   onPresence: (present: boolean) => void;
+   onNavigate: (page: GymPage) => void;
+ }) {
++  const [celebrateBurstKey, setCelebrateBurstKey] = useState(0);
++  const [previewCelebration, setPreviewCelebration] = useState(false);
++
+   const checkedIn = Boolean(session?.checkedInAt);
+   const nextBooking = bookings.find((booking) => Date.parse(booking.startsAt) > Date.now());
+   const weekWorkouts = getThisWeekWorkouts(workouts);
+   const weeklyVolume = calculateWorkoutVolume(weekWorkouts);
+ 
++  const effectiveWorkoutsCount = previewCelebration ? Math.max(weeklyGoal, 3) : weekWorkouts.length;
++  const isGoalReached = weeklyGoal > 0 && effectiveWorkoutsCount >= weeklyGoal;
++  const progressPercent = weeklyGoal > 0 ? Math.min(100, Math.round((effectiveWorkoutsCount / weeklyGoal) * 100)) : 100;
++  const remaining = Math.max(0, weeklyGoal - effectiveWorkoutsCount);
++  const isExceeded = effectiveWorkoutsCount > weeklyGoal;
++
++  const triggerCelebration = useCallback(() => {
++    setCelebrateBurstKey((prev) => prev + 1);
++  }, []);
++
+   return (
+     <>
+-      <PageHeading eyebrow="DHBW GYM HUB" title="Dein Gym, auf einen Blick" description="Belegung, Trainingsplanung und dein persönlicher Fortschritt." />
++      <PageHeading
++        eyebrow="DHBW GYM HUB"
++        title="Dein Gym, auf einen Blick"
++        description="Belegung, Trainingsplanung und dein persönlicher Fortschritt."
++      />
+ 
+       {error && <InlineNotice tone="error">{error}</InlineNotice>}
+ 
+       <section className="dashboard-feature-grid" aria-label="Aktuelle Gym-Informationen">
+         <article className="surface occupancy-panel">
+-          <div className="panel-topline"><span className="icon-badge"><Users size={18} aria-hidden="true" /></span><span className={`connection-state ${online ? 'is-online' : ''}`}><span aria-hidden="true" />{online ? 'Backend verbunden' : 'Keine Verbindung'}</span></div>
++          <div className="panel-topline">
++            <span className="icon-badge"><Users size={18} aria-hidden="true" /></span>
++            <span className={`connection-state ${online ? 'is-online' : ''}`}>
++              <span aria-hidden="true" />{online ? 'Backend verbunden' : 'Keine Verbindung'}
++            </span>
++          </div>
+           <p className="panel-label">Aktuell eingecheckt</p>
+-          {online && occupancy ? <p className="occupancy-number" aria-live="polite">{occupancy.count}<span> Personen</span></p> : <p className="occupancy-unavailable">{online ? 'Wird geladen â€¦' : 'Gerade nicht verfügbar'}</p>}
+-          <p className="muted-copy">{occupancy ? `Aktualisiert ${formatTime(occupancy.refreshedAt)} · manuelle Meldungen` : 'Die Zahl stammt aus Check-ins in dieser App.'}</p>
++          {online && occupancy ? (
++            <p className="occupancy-number" aria-live="polite">
++              {occupancy.count}<span> Personen</span>
++            </p>
++          ) : (
++            <p className="occupancy-unavailable">{online ? 'Wird geladen …' : 'Gerade nicht verfügbar'}</p>
++          )}
++          <p className="muted-copy">
++            {occupancy
++              ? `Aktualisiert ${formatTime(occupancy.refreshedAt)} · manuelle Meldungen`
++              : 'Die Zahl stammt aus Check-ins in dieser App.'}
++          </p>
+           <div className="source-note">Nicht mit dem DHBW-Türsystem verbunden</div>
+         </article>
+ 
+         <article className={`surface presence-panel ${checkedIn ? 'is-present' : ''}`}>
+-          <div className="panel-topline"><span className="icon-badge">{checkedIn ? <Check size={18} aria-hidden="true" /> : <Clock3 size={18} aria-hidden="true" />}</span><span className="panel-label">Dein Status</span></div>
++          <div className="panel-topline">
++            <span className="icon-badge">
++              {checkedIn ? <Check size={18} aria-hidden="true" /> : <Clock3 size={18} aria-hidden="true" />}
++            </span>
++            <span className="panel-label">Dein Status</span>
++          </div>
+           <h2>{checkedIn ? 'Du bist eingecheckt' : 'Noch nicht eingecheckt'}</h2>
+-          <p className="muted-copy">{checkedIn && session?.checkedInAt ? `Seit ${formatTime(session.checkedInAt)} · endet automatisch nach ${session.maxCheckInHours} Stunden` : 'Mit einem Tipp meldest du dich in der gemeinsamen Belegung an.'}</p>
+-          <button type="button" className={`button ${checkedIn ? 'button-secondary' : 'button-primary'} presence-button`} disabled={!online || busy} onClick={() => onPresence(!checkedIn)}>
+-            {checkedIn ? <><LogOut size={17} aria-hidden="true" />Ich gehe</> : <><LogIn size={17} aria-hidden="true" />Ich bin drin</>}
++          <p className="muted-copy">
++            {checkedIn && session?.checkedInAt
++              ? `Seit ${formatTime(session.checkedInAt)} · endet automatisch nach ${session.maxCheckInHours} Stunden`
++              : 'Mit einem Tipp meldest du dich in der gemeinsamen Belegung an.'}
++          </p>
++          <button
++            type="button"
++            className={`button ${checkedIn ? 'button-secondary' : 'button-primary'} presence-button`}
++            disabled={!online || busy}
++            onClick={() => onPresence(!checkedIn)}
++          >
++            {checkedIn ? (
++              <><LogOut size={17} aria-hidden="true" />Ich gehe</>
++            ) : (
++              <><LogIn size={17} aria-hidden="true" />Ich bin drin</>
++            )}
+           </button>
+           {!online && <p className="field-hint">Check-in ist verfügbar, sobald die Verbindung wiederhergestellt ist.</p>}
+         </article>
+@@ -183,19 +263,246 @@ export function Dashboard({
+           </div>
+         )}
+       </section>
++
+       <section className="dashboard-secondary-grid" aria-label="Deine nächsten Aktivitäten">
+         <article className="surface compact-panel">
+-          <SectionTitle title="Nächste Trainingseinheit" action={<button className="text-action" onClick={() => onNavigate('calendar')}>Kalender <ArrowRight size={15} aria-hidden="true" /></button>} />
+-          {nextBooking ? <div className="next-booking"><span className="date-marker">{new Date(nextBooking.startsAt).toLocaleDateString('de-DE', { day: '2-digit', month: 'short' })}</span><div><strong>{nextBooking.title || 'Training im Gym'}</strong><p>{formatDateTime(nextBooking.startsAt)} · bis {formatTime(nextBooking.endsAt)}</p></div></div> : <p className="muted-copy">Noch nichts geplant. Reserviere dir eine Trainingszeit.</p>}
++          <SectionTitle
++            title="Nächste Trainingseinheit"
++            action={
++              <button
++                type="button"
++                className="text-action"
++                onClick={() => onNavigate('calendar')}
++              >
++                Kalender <ArrowRight size={15} aria-hidden="true" />
++              </button>
++            }
++          />
++          {nextBooking ? (
++            <div className="next-booking">
++              <span className="date-marker">
++                {new Date(nextBooking.startsAt).toLocaleDateString('de-DE', { day: '2-digit', month: 'short' })}
++              </span>
++              <div>
++                <strong>{nextBooking.title || 'Training im Gym'}</strong>
++                <p>{formatDateTime(nextBooking.startsAt)} · bis {formatTime(nextBooking.endsAt)}</p>
++              </div>
++            </div>
++          ) : (
++            <p className="muted-copy">Noch nichts geplant. Reserviere dir eine Trainingszeit.</p>
++          )}
+         </article>
+-        <article className="surface compact-panel progress-glance">
+-          <SectionTitle title="Diese Woche" action={<button className="text-action" onClick={() => onNavigate('progress')}>Fortschritt <ArrowRight size={15} aria-hidden="true" /></button>} />
+-          <div className="glance-stats"><div><strong>{weekWorkouts.length}</strong><span>Einheiten</span></div><div><strong>{Math.round(weeklyVolume).toLocaleString('de-DE')}<small> kg</small></strong><span>Trainingsvolumen</span></div></div>
++
++        <article
++          className={`surface compact-panel progress-glance ${isGoalReached ? 'is-goal-reached' : ''}`}
++          aria-label="Wöchentliches Trainingsziel und Fortschritt"
++        >
++          {isGoalReached && (
++            <div key={celebrateBurstKey} className="goal-confetti-container" aria-hidden="true">
++              {CONFETTI_PARTICLES.map((p) => (
++                <span
++                  key={p.id}
++                  className="goal-confetti-particle"
++                  style={{
++                    '--tx': p.tx,
++                    '--ty': p.ty,
++                    '--rot': p.rot,
++                    '--bg': p.bg,
++                    '--size': p.size,
++                    '--radius': p.radius,
++                    '--delay': p.delay,
++                  } as React.CSSProperties}
++                />
++              ))}
++            </div>
++          )}
++
++          <div className="progress-glance-header">
++            <SectionTitle
++              title="Wochenziel & Fortschritt"
++              action={
++                <button
++                  type="button"
++                  className="text-action"
++                  onClick={() => onNavigate('progress')}
++                >
++                  Fortschritt <ArrowRight size={15} aria-hidden="true" />
++                </button>
++              }
++            />
++          </div>
++
++          {isGoalReached ? (
++            <div className="goal-reached-hero" key={`hero-${celebrateBurstKey}`}>
++              <div className="goal-badge-row">
++                <div className="goal-trophy-wrapper">
++                  <span className="goal-trophy-pulse-ring" aria-hidden="true" />
++                  <Trophy size={20} className="trophy-bounce-icon" aria-hidden="true" />
++                </div>
++                <div className="goal-achievement-info">
++                  <div className="goal-reached-pill">
++                    <Sparkles size={13} className="sparkle-icon" aria-hidden="true" />
++                    <span>Wochenziel erreicht!</span>
++                    <Sparkles size={13} className="sparkle-icon" aria-hidden="true" />
++                  </div>
++                  <p className="goal-achievement-copy">
++                    {isExceeded
++                      ? `🔥 Überragend! ${effectiveWorkoutsCount} von ${weeklyGoal} Einheiten geschafft (+${effectiveWorkoutsCount - weeklyGoal} Bonus!)`
++                      : `🎉 Perfekt! ${effectiveWorkoutsCount} von ${weeklyGoal} Einheiten erfolgreich absolviert.`}
++                  </p>
++                </div>
++              </div>
++
++              {/* Shimmering Animated Progress Bar */}
++              <div className="goal-progress-wrap">
++                <div
++                  className="goal-progress-track is-achieved"
++                  role="progressbar"
++                  aria-valuenow={progressPercent}
++                  aria-valuemin={0}
++                  aria-valuemax={100}
++                >
++                  <div
++                    className="goal-progress-fill is-achieved"
++                    style={{ '--target-width': `${progressPercent}%` } as React.CSSProperties}
++                  >
++                    <span className="goal-shimmer-sheen" aria-hidden="true" />
++                  </div>
++                </div>
++
++                {/* Step dots */}
++                <div className="goal-step-dots" aria-hidden="true">
++                  {Array.from({ length: Math.min(6, weeklyGoal) }).map((_, index) => (
++                    <span key={index} className="goal-step-dot is-completed">
++                      <Check size={11} strokeWidth={3} />
++                    </span>
++                  ))}
++                  {isExceeded && (
++                    <span className="goal-step-dot is-bonus" title="Bonus Einheit">
++                      <Flame size={12} />
++                    </span>
++                  )}
++                </div>
++              </div>
++
++              {/* Stats & Actions */}
++              <div className="goal-footer-row">
++                <div className="glance-stats">
++                  <div>
++                    <strong>{effectiveWorkoutsCount} <small>/ {weeklyGoal}</small></strong>
++                    <span>Einheiten</span>
++                  </div>
++                  <div>
++                    <strong>{Math.round(weeklyVolume).toLocaleString('de-DE')}<small> kg</small></strong>
++                    <span>Volumen</span>
++                  </div>
++                </div>
++
++                <div className="goal-actions-group">
++                  <button
++                    type="button"
++                    className="goal-celebrate-btn"
++                    onClick={triggerCelebration}
++                    title="Feier-Animation erneut abspielen"
++                  >
++                    <PartyPopper size={14} aria-hidden="true" />
++                    <span>Jubeln!</span>
++                  </button>
++                  {previewCelebration && (
++                    <button
++                      type="button"
++                      className="goal-preview-btn is-active"
++                      onClick={() => setPreviewCelebration(false)}
++                      title="Vorschau beenden"
++                    >
++                      Vorschau aus
++                    </button>
++                  )}
++                </div>
++              </div>
++            </div>
++          ) : (
++            <div className="goal-pending-hero">
++              <div className="goal-badge-row">
++                <div className="goal-icon-wrapper">
++                  <Dumbbell size={19} aria-hidden="true" />
++                </div>
++                <div className="goal-achievement-info">
++                  <div className="goal-pending-pill">
++                    <span>Noch {remaining} {remaining === 1 ? 'Einheit' : 'Einheiten'} bis zum Ziel</span>
++                  </div>
++                  <p className="goal-achievement-copy">
++                    Wochenziel: {effectiveWorkoutsCount} von {weeklyGoal} Trainings absolviert
++                  </p>
++                </div>
++              </div>
++
++              {/* Animated Progress Bar */}
++              <div className="goal-progress-wrap">
++                <div
++                  className="goal-progress-track"
++                  role="progressbar"
++                  aria-valuenow={progressPercent}
++                  aria-valuemin={0}
++                  aria-valuemax={100}
++                >
++                  <div
++                    className="goal-progress-fill"
++                    style={{
++                      width: `${progressPercent}%`,
++                      '--target-width': `${progressPercent}%`,
++                    } as React.CSSProperties}
++                  />
++                </div>
++
++                {/* Step dots */}
++                <div className="goal-step-dots" aria-hidden="true">
++                  {Array.from({ length: Math.min(6, weeklyGoal) }).map((_, index) => {
++                    const isDone = index < effectiveWorkoutsCount;
++                    return (
++                      <span
++                        key={index}
++                        className={`goal-step-dot ${isDone ? 'is-completed' : ''}`}
++                      >
++                        {isDone ? <Check size={11} strokeWidth={3} /> : index + 1}
++                      </span>
++                    );
++                  })}
++                </div>
++              </div>
++
++              {/* Stats & Actions */}
++              <div className="goal-footer-row">
++                <div className="glance-stats">
++                  <div>
++                    <strong>{effectiveWorkoutsCount} <small>/ {weeklyGoal}</small></strong>
++                    <span>Einheiten</span>
++                  </div>
++                  <div>
++                    <strong>{Math.round(weeklyVolume).toLocaleString('de-DE')}<small> kg</small></strong>
++                    <span>Volumen</span>
++                  </div>
++                </div>
++
++                <div className="goal-actions-group">
++                  <button
++                    type="button"
++                    className="goal-preview-btn"
++                    onClick={() => {
++                      setPreviewCelebration(true);
++                      triggerCelebration();
++                    }}
++                    title="Vorschau der Erreicht-Animation anzeigen"
++                  >
++                    <Sparkles size={13} aria-hidden="true" />
++                    <span>Animation testen</span>
++                  </button>
++                </div>
++              </div>
++            </div>
++          )}
+         </article>
+       </section>
+     </>
+   );
+ }
+-
+-
+-
+diff --git a/src/features/gym/GymApp.tsx b/src/features/gym/GymApp.tsx
+index 3f4c011..f545833 100644
+--- a/src/features/gym/GymApp.tsx
++++ b/src/features/gym/GymApp.tsx
+@@ -391,6 +391,7 @@ export function GymApp() {
+           onOccupancyRangeChange={setOccupancyRange}
+           bookings={bookings}
+           workouts={workouts}
++          weeklyGoal={weeklyGoal}
+           online={online}
+           busy={busy}
+           error={error}
+diff --git a/src/features/gym/gym.css b/src/features/gym/gym.css
+index e4eddf2..e85150b 100644
+--- a/src/features/gym/gym.css
++++ b/src/features/gym/gym.css
+@@ -1893,3 +1893,487 @@
+   }
+ }
+ 
++/* ==========================================================================
++   Wochenziel Erreicht – CSS-Animationen & Motivierender Fortschritt
++   ========================================================================== */
++
++.progress-glance {
++  position: relative;
++  overflow: hidden;
++  transition: border-color 0.4s ease, box-shadow 0.4s ease;
++}
++
++/* Reached state card highlighting */
++.progress-glance.is-goal-reached {
++  border-color: rgba(142, 189, 156, 0.45);
++  background: linear-gradient(155deg, rgba(22, 38, 29, 0.6) 0%, rgba(18, 26, 23, 0.8) 40%, rgba(15, 20, 26, 0.95) 100%);
++  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(142, 189, 156, 0.28);
++  animation: goalGlowPulse 4s ease-in-out infinite;
++}
++
++@keyframes goalGlowPulse {
++  0%, 100% {
++    border-color: rgba(142, 189, 156, 0.4);
++    box-shadow: 0 6px 26px rgba(0, 0, 0, 0.35), 0 0 16px rgba(16, 185, 129, 0.12);
++  }
++  50% {
++    border-color: rgba(245, 158, 11, 0.6);
++    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 26px rgba(245, 158, 11, 0.24), 0 0 0 1px rgba(245, 158, 11, 0.4);
++  }
++}
++
++/* Confetti Container & Particles */
++.goal-confetti-container {
++  position: absolute;
++  top: 52px;
++  left: 48px;
++  width: 1px;
++  height: 1px;
++  pointer-events: none;
++  z-index: 10;
++}
++
++.goal-confetti-particle {
++  position: absolute;
++  top: 0;
++  left: 0;
++  width: var(--size, 7px);
++  height: var(--size, 7px);
++  border-radius: var(--radius, 2px);
++  background: var(--bg, #fbbf24);
++  opacity: 0;
++  transform: translate(0, 0) scale(0);
++  animation: confettiBurst 2.2s cubic-bezier(0.2, 0.9, 0.3, 1) var(--delay, 0s) forwards;
++}
++
++@keyframes confettiBurst {
++  0% {
++    transform: translate(0, 0) scale(0) rotate(0deg);
++    opacity: 1;
++  }
++  20% {
++    transform: translate(calc(var(--tx) * 0.4), calc(var(--ty) * 0.5 - 18px)) scale(1.3) rotate(calc(var(--rot) * 0.3));
++    opacity: 1;
++  }
++  60% {
++    transform: translate(calc(var(--tx) * 0.8), calc(var(--ty) * 0.8 + 6px)) scale(1) rotate(calc(var(--rot) * 0.7));
++    opacity: 0.9;
++  }
++  100% {
++    transform: translate(var(--tx), calc(var(--ty) + 32px)) scale(0.3) rotate(var(--rot));
++    opacity: 0;
++  }
++}
++
++/* Goal Hero Headers */
++.goal-reached-hero,
++.goal-pending-hero {
++  display: flex;
++  flex-direction: column;
++  gap: 14px;
++  margin-top: 14px;
++}
++
++.goal-badge-row {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++}
++
++/* Trophy animation wrapper */
++.goal-trophy-wrapper {
++  position: relative;
++  display: grid;
++  place-items: center;
++  width: 44px;
++  height: 44px;
++  flex-shrink: 0;
++  border-radius: 12px;
++  background: linear-gradient(135deg, rgba(245, 158, 11, 0.25), rgba(16, 185, 129, 0.2));
++  border: 1px solid rgba(245, 158, 11, 0.5);
++  color: #fbbf24;
++  box-shadow: 0 0 16px rgba(245, 158, 11, 0.25);
++  animation: trophyBounce 1.1s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
++}
++
++.trophy-bounce-icon {
++  animation: trophyGleam 2.5s ease-in-out infinite 1.2s;
++}
++
++@keyframes trophyBounce {
++  0% {
++    transform: scale(0.4) rotate(-15deg);
++    opacity: 0;
++  }
++  50% {
++    transform: scale(1.22) rotate(8deg);
++  }
++  75% {
++    transform: scale(0.92) rotate(-4deg);
++  }
++  100% {
++    transform: scale(1) rotate(0deg);
++    opacity: 1;
++  }
++}
++
++@keyframes trophyGleam {
++  0%, 100% {
++    transform: scale(1);
++    filter: drop-shadow(0 0 2px rgba(251, 191, 36, 0.4));
++  }
++  50% {
++    transform: scale(1.12);
++    filter: drop-shadow(0 0 8px rgba(251, 191, 36, 0.9));
++  }
++}
++
++/* Pulsing aura ring around trophy */
++.goal-trophy-pulse-ring {
++  position: absolute;
++  inset: -4px;
++  border-radius: 16px;
++  border: 1.5px solid rgba(245, 158, 11, 0.6);
++  pointer-events: none;
++  animation: pulseRing 2.4s cubic-bezier(0.1, 0.8, 0.2, 1) infinite;
++}
++
++@keyframes pulseRing {
++  0% {
++    transform: scale(0.85);
++    opacity: 0.9;
++  }
++  60% {
++    transform: scale(1.35);
++    opacity: 0;
++  }
++  100% {
++    transform: scale(1.4);
++    opacity: 0;
++  }
++}
++
++/* Pending Goal Icon */
++.goal-icon-wrapper {
++  display: grid;
++  place-items: center;
++  width: 44px;
++  height: 44px;
++  flex-shrink: 0;
++  border-radius: 12px;
++  background: var(--gym-surface-2);
++  border: 1px solid var(--gym-border);
++  color: var(--gym-accent);
++}
++
++.goal-achievement-info {
++  display: flex;
++  min-width: 0;
++  flex: 1;
++  flex-direction: column;
++  gap: 3px;
++}
++
++/* Celebratory Pill Badge */
++.goal-reached-pill {
++  display: inline-flex;
++  align-items: center;
++  align-self: flex-start;
++  gap: 6px;
++  padding: 3px 10px;
++  border-radius: 999px;
++  background: linear-gradient(90deg, rgba(16, 185, 129, 0.28), rgba(245, 158, 11, 0.28));
++  border: 1px solid rgba(245, 158, 11, 0.55);
++  color: #fef08a;
++  font-size: 11px;
++  font-weight: 700;
++  letter-spacing: 0.02em;
++  box-shadow: 0 0 12px rgba(245, 158, 11, 0.2);
++  animation: badgePop 0.8s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
++}
++
++@keyframes badgePop {
++  0% {
++    transform: scale(0.7);
++    opacity: 0;
++  }
++  60% {
++    transform: scale(1.08);
++  }
++  100% {
++    transform: scale(1);
++    opacity: 1;
++  }
++}
++
++.sparkle-icon {
++  color: #fde047;
++  animation: sparkleTwinkle 2s ease-in-out infinite;
++}
++
++@keyframes sparkleTwinkle {
++  0%, 100% {
++    transform: scale(0.9) rotate(0deg);
++    opacity: 0.7;
++  }
++  50% {
++    transform: scale(1.35) rotate(90deg);
++    opacity: 1;
++  }
++}
++
++.goal-pending-pill {
++  display: inline-flex;
++  align-items: center;
++  align-self: flex-start;
++  gap: 6px;
++  padding: 3px 9px;
++  border-radius: 999px;
++  background: rgba(142, 189, 156, 0.12);
++  border: 1px solid rgba(142, 189, 156, 0.25);
++  color: var(--gym-accent-strong);
++  font-size: 11px;
++  font-weight: 600;
++}
++
++.goal-achievement-copy {
++  margin: 0;
++  color: #c9d4cd;
++  font-size: 11px;
++  line-height: 1.4;
++}
++
++/* Progress Bar Track & Fill */
++.goal-progress-wrap {
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++}
++
++.goal-progress-track {
++  position: relative;
++  height: 8px;
++  border-radius: 999px;
++  background: #1c232a;
++  overflow: hidden;
++  border: 1px solid rgba(255, 255, 255, 0.05);
++}
++
++.goal-progress-track.is-achieved {
++  background: #19251e;
++  border-color: rgba(16, 185, 129, 0.35);
++  box-shadow: 0 0 10px rgba(16, 185, 129, 0.25);
++}
++
++.goal-progress-fill {
++  position: relative;
++  height: 100%;
++  border-radius: inherit;
++  background: var(--gym-accent);
++  transition: width 0.7s cubic-bezier(0.34, 1.56, 0.64, 1);
++  animation: barFillAnim 0.9s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
++}
++
++@keyframes barFillAnim {
++  from {
++    width: 0% !important;
++  }
++  to {
++    width: var(--target-width, 100%) !important;
++  }
++}
++
++/* Celebratory Shimmering Bar */
++.goal-progress-fill.is-achieved {
++  background: linear-gradient(90deg, #10b981 0%, #34d399 30%, #fbbf24 60%, #10b981 100%);
++  background-size: 250% 100%;
++  box-shadow: 0 0 14px rgba(52, 211, 153, 0.6), 0 0 24px rgba(251, 191, 36, 0.35);
++  animation: barFillAnim 0.9s ease-out forwards, shimmerFlow 3s linear infinite;
++}
++
++@keyframes shimmerFlow {
++  0% {
++    background-position: 250% 0;
++  }
++  100% {
++    background-position: -250% 0;
++  }
++}
++
++.goal-shimmer-sheen {
++  position: absolute;
++  inset: 0;
++  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.4) 50%, transparent 100%);
++  animation: sheenSlide 2.2s infinite ease-in-out;
++}
++
++@keyframes sheenSlide {
++  0% {
++    transform: translateX(-150%);
++  }
++  100% {
++    transform: translateX(250%);
++  }
++}
++
++/* Step Dots */
++.goal-step-dots {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++
++.goal-step-dot {
++  display: grid;
++  place-items: center;
++  width: 22px;
++  height: 22px;
++  border-radius: 50%;
++  background: #1a2229;
++  border: 1px solid var(--gym-border);
++  color: var(--gym-muted);
++  font-size: 10px;
++  font-weight: 600;
++  transition: all 0.3s ease;
++}
++
++.goal-step-dot.is-completed {
++  background: linear-gradient(135deg, #10b981, #059669);
++  border-color: #34d399;
++  color: #ffffff;
++  box-shadow: 0 0 8px rgba(16, 185, 129, 0.4);
++  animation: dotBounceIn 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
++}
++
++.goal-step-dot.is-bonus {
++  background: linear-gradient(135deg, #f59e0b, #d97706);
++  border-color: #fcd34d;
++  color: #ffffff;
++  box-shadow: 0 0 10px rgba(245, 158, 11, 0.5);
++  animation: dotBounceIn 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
++}
++
++@keyframes dotBounceIn {
++  0% {
++    transform: scale(0.4);
++    opacity: 0;
++  }
++  70% {
++    transform: scale(1.25);
++  }
++  100% {
++    transform: scale(1);
++    opacity: 1;
++  }
++}
++
++/* Footer Row */
++.goal-footer-row {
++  display: flex;
++  align-items: flex-end;
++  justify-content: space-between;
++  gap: 12px;
++  margin-top: 2px;
++}
++
++.goal-footer-row .glance-stats {
++  margin-top: 0;
++}
++
++.goal-actions-group {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++
++/* Celebrate Action Button */
++.goal-celebrate-btn {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  min-height: 32px;
++  padding: 0 12px;
++  border-radius: 999px;
++  background: linear-gradient(135deg, rgba(245, 158, 11, 0.2), rgba(16, 185, 129, 0.2));
++  border: 1px solid rgba(245, 158, 11, 0.5);
++  color: #fde68a;
++  font-size: 11px;
++  font-weight: 650;
++  cursor: pointer;
++  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
++  transition: all 0.2s ease;
++}
++
++.goal-celebrate-btn:hover {
++  background: linear-gradient(135deg, rgba(245, 158, 11, 0.35), rgba(16, 185, 129, 0.35));
++  border-color: rgba(245, 158, 11, 0.8);
++  transform: translateY(-1px) scale(1.03);
++  box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
++}
++
++.goal-celebrate-btn:active {
++  transform: translateY(1px) scale(0.97);
++}
++
++/* Preview Toggle Button */
++.goal-preview-btn {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  min-height: 28px;
++  padding: 0 9px;
++  border-radius: 8px;
++  background: rgba(255, 255, 255, 0.05);
++  border: 1px solid var(--gym-border);
++  color: var(--gym-muted);
++  font-size: 10px;
++  font-weight: 550;
++  cursor: pointer;
++  transition: all 0.2s ease;
++}
++
++.goal-preview-btn:hover {
++  color: var(--gym-text);
++  border-color: var(--gym-accent);
++  background: rgba(142, 189, 156, 0.1);
++}
++
++.goal-preview-btn.is-active {
++  background: rgba(245, 158, 11, 0.15);
++  border-color: rgba(245, 158, 11, 0.4);
++  color: #fbbf24;
++}
++
++/* Accessibility: Reduced Motion */
++@media (prefers-reduced-motion: reduce) {
++  .progress-glance.is-goal-reached,
++  .goal-trophy-wrapper,
++  .trophy-bounce-icon,
++  .goal-trophy-pulse-ring,
++  .goal-reached-pill,
++  .sparkle-icon,
++  .goal-confetti-particle,
++  .goal-progress-fill,
++  .goal-progress-fill.is-achieved,
++  .goal-shimmer-sheen,
++  .goal-step-dot.is-completed,
++  .goal-step-dot.is-bonus {
++    animation: none !important;
++    transition: none !important;
++  }
++}
++
++@media (max-width: 600px) {
++  .goal-footer-row {
++    flex-direction: column;
++    align-items: flex-start;
++    gap: 12px;
++  }
++
++  .goal-actions-group {
++    width: 100%;
++    justify-content: flex-end;
++  }
++}
++
++
+-- 
+2.34.1
+

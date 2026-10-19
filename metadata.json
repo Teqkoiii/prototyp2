@@ -1,0 +1,6 @@
+{
+  "name": "DHBW Gym Bad Mergentheim Community",
+  "description": "Moderne Community-Plattform für das DHBW-Gym Bad Mergentheim mit gemeinsamem Kalender, Live-Anwesenheit und Trainingspartner-Suche.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
