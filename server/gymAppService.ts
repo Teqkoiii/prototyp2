@@ -55,7 +55,7 @@ function isDate(value: unknown): value is string {
 
 export function isWorkoutDateWithinRange(value: string, now: number): boolean {
   const calendarDate = value.slice(0, 10);
-  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(calendarDate)) return false;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(calendarDate)) return false;
 
   const parsedDate = new Date(`${calendarDate}T00:00:00.000Z`);
   if (!Number.isFinite(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== calendarDate) return false;
