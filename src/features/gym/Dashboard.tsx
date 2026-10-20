@@ -182,15 +182,12 @@ export function Dashboard({
                   dataKey="at"
                   tickFormatter={(value) => {
                     const date = new Date(String(value));
-
                     if (occupancyRange === '7d') {
-                      return date.toLocaleString('de-DE', {
-                        weekday: 'short',
-                        hour: '2-digit',
-                        minute: '2-digit',
+                      return date.toLocaleDateString('de-DE', {
+                        day: '2-digit',
+                        month: '2-digit',
                       });
                     }
-
                     if (occupancyRange === '24h') {
                       return date.toLocaleString('de-DE', {
                         day: '2-digit',
@@ -199,11 +196,7 @@ export function Dashboard({
                         minute: '2-digit',
                       });
                     }
-
-                    return date.toLocaleTimeString('de-DE', {
-                      hour: '2-digit',
-                      minute: '2-digit',
-                    });
+                    return formatTime(String(value));
                   }}
                   tick={{ fill: 'var(--gym-muted)', fontSize: 11 }}
                   minTickGap={28}
