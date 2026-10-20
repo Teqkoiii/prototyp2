@@ -53,6 +53,21 @@ function isDate(value: unknown): value is string {
   return typeof value === 'string' && Number.isFinite(Date.parse(value));
 }
 
+export function isWorkoutDateWithinRange(value: string, now: number): boolean {
+  const calendarDate = value.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(calendarDate)) return false;
+
+  const parsedDate = new Date(`${calendarDate}T00:00:00.000Z`);
+  if (!Number.isFinite(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== calendarDate) return false;
+
+  const today = new Date(now).toISOString().slice(0, 10);
+  const oldest = new Date(`${today}T00:00:00.000Z`);
+  oldest.setUTCFullYear(oldest.getUTCFullYear() - 1);
+  const oldestDate = oldest.toISOString().slice(0, 10);
+
+  return calendarDate >= oldestDate && calendarDate <= today;
+}
+
 function normalizeEmail(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const email = value.trim().toLowerCase();
@@ -536,7 +551,7 @@ export class GymAppService {
     }
     const timestamp = this.now();
     const occurredAtMs = Date.parse(input.occurredAt);
-    if (occurredAtMs > timestamp + 60_000 || occurredAtMs < timestamp - 365 * 86400_000) {
+    if (!isWorkoutDateWithinRange(input.occurredAt, timestamp)) {
       throw new GymDomainError('workout date must be within the past year and not in the future', 400);
     }
     const exercises = input.exercises as unknown[];

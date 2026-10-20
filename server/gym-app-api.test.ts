@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import test, { type TestContext } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { createGymAppApi } from './gym-app-api.ts';
+import { isWorkoutDateWithinRange } from './gymAppService.ts';
 
 async function startApi(t: TestContext, options: { secureCookies?: boolean; allowedOrigins?: string[] } = {}) {
   const database = new DatabaseSync(':memory:');
@@ -208,4 +209,16 @@ test('profile recovery attempts are rate limited', async (t) => {
     statuses.push(response.status);
   }
   assert.deepEqual(statuses, [401, 401, 401, 401, 401, 429]);
+});
+
+
+test('workout dates are validated by calendar day with inclusive one-year boundaries', () => {
+  const now = Date.parse('2026-10-20T08:00:00.000Z');
+  const date = (value: string) => `${value}T12:00:00.000Z`;
+
+  assert.equal(isWorkoutDateWithinRange(date('2026-10-20'), now), true, 'today is valid even if the selected time is later than now');
+  assert.equal(isWorkoutDateWithinRange(date('2026-10-19'), now), true, 'yesterday is valid');
+  assert.equal(isWorkoutDateWithinRange(date('2025-10-20'), now), true, 'the exact one-year boundary is valid');
+  assert.equal(isWorkoutDateWithinRange(date('2025-10-19'), now), false, 'dates before the one-year boundary are invalid');
+  assert.equal(isWorkoutDateWithinRange(date('2026-10-21'), now), false, 'future calendar dates are invalid');
 });
